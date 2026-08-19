@@ -36,6 +36,7 @@ const BANNED_CRATES: &[&str] = &[
     "tract-core",
     "tungstenite",
     "ureq",
+    "kenlm",
 ];
 
 pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
