@@ -29,6 +29,8 @@ pub struct RankInput<'a> {
     pub input_tokens: &'a [TokenId],
     /// Pattern-input cosine of the trigger hit, or 0.
     pub trigger_match: f32,
+    /// Closed analog of RLHF: additive logit on PathKind from `/good` `/bad`.
+    pub path_prior: [f32; 4],
 }
 
 pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32 {
@@ -67,7 +69,9 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
         let toks = input.tokens.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
         let denom = toks.len().max(1) as f32;
         let rote = params.rote_penalty * (lcsubstr_len(toks, input.input_tokens) as f32 / denom);
-        let score = topic_s + source_bias(source, params, input.trigger_match)
+        let score = topic_s
+            + source_bias(source, params, input.trigger_match)
+            + input.path_prior[crate::route::prior_index(source)]
             - rote
             - params.band_penalty * band_hinge(topic_s, params.band_lo, params.band_hi);
         scored.push((i, score, topic_s));
@@ -136,6 +140,7 @@ mod tests {
                 sources: &sources,
                 input_tokens: &[],
                 trigger_match: 0.0,
+                path_prior: [0.0; 4],
             },
             &params,
             &mut rng,
@@ -166,6 +171,7 @@ mod tests {
                 sources: &sources,
                 input_tokens: &[7, 8],
                 trigger_match: 1.0,
+                path_prior: [0.0; 4],
             },
             &params,
             &mut rng,
