@@ -103,6 +103,23 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
         },
         format!("path={:?} text={}", r.trace.path, r.text),
     );
+    let pool_has_echo = r
+        .trace
+        .candidates
+        .iter()
+        .any(|c| c.source == PathKind::Echo);
+    check(
+        "hybrid-pool",
+        if pool_has_echo {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        format!(
+            "trigger hit still lists Echo in the pool (n={})",
+            r.trace.candidates.len()
+        ),
+    );
 
     let p0 = Params {
         p_slip: 0.0,
@@ -285,12 +302,11 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
     let p99 = percentile_us(&mut times);
     check(
         "latency-p99",
-        if p99 <= 30_000 {
-            Status::Pass
-        } else {
-            Status::Fail
-        },
-        format!("{p99}us (budget 30ms incl. hash-embed)"),
+        nfr_status(p99 <= 30_000),
+        nfr_detail(
+            p99 <= 30_000,
+            format!("{p99}us (budget 30ms incl. hash-embed)"),
+        ),
     );
 
     let mut gen_times = Vec::with_capacity(turns);
@@ -302,12 +318,11 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
     let gen_p99 = percentile_us(&mut gen_times);
     check(
         "engine-p99",
-        if gen_p99 <= 2_000 {
-            Status::Pass
-        } else {
-            Status::Fail
-        },
-        format!("{gen_p99}us (budget 2ms, Markov draw only)"),
+        nfr_status(gen_p99 <= 2_000),
+        nfr_detail(
+            gen_p99 <= 2_000,
+            format!("{gen_p99}us (budget 2ms, Markov draw only)"),
+        ),
     );
 
     let blob = "あいうえおかきくけこ".repeat(20_000);
@@ -355,6 +370,26 @@ enum Status {
     Pass,
     Fail,
     Skip,
+}
+
+/// Timing NFR is a release number. Debug CI (GHA shared runners) may miss
+/// the 2ms engine / 30ms respond budgets the way tokenize misses 50MB/s.
+fn nfr_status(ok: bool) -> Status {
+    if ok {
+        Status::Pass
+    } else if cfg!(debug_assertions) {
+        Status::Skip
+    } else {
+        Status::Fail
+    }
+}
+
+fn nfr_detail(ok: bool, detail: String) -> String {
+    if ok || !cfg!(debug_assertions) {
+        detail
+    } else {
+        format!("{detail}; debug skipped")
+    }
 }
 
 fn lockfile_banned() -> std::result::Result<(), String> {

@@ -60,7 +60,7 @@ spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL が�
 | 耐障害 | append-only + fsync | `sync_data` のあと別 `Engine::open` で復元 | PASS |
 | ホットパスヒープゼロ | 目標 | `respond` が Vec/String を確保 | SKIP |
 
-debug ビルドのトークナイズは ~6MB/s で要件未満のため、`munou verify` は debug では tokenize を SKIP する。CI の軽量 verify も debug。NFR の正は release。
+debug ビルドのトークナイズは ~6MB/s で要件未満、engine-p99 も debug では 2ms 際どいため、`munou verify` は debug で外れた tokenize / latency-p99 / engine-p99 を SKIP する。CI の軽量 verify も debug。NFR の正は release。
 
 ## コンポーネント対応
 
