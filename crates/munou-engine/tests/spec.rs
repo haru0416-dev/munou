@@ -26,7 +26,8 @@ fn trigger_wins_greeting_against_echo() {
     let trig = dir.join("t.json");
     fs::write(
         &trig,
-        r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
+        r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]
+"#,
     )
     .unwrap();
     let mut e = Engine::ephemeral(Params::default(), 3).unwrap();
