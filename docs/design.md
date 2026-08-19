@@ -125,9 +125,10 @@ LLMを使わず、理解せずに会話が成立する対話プログラムを�
 
 - 単位: 文節チャンク。文法的破綻を抑えつつ意味のズレを残す
 - 次数: 可変長。接尾辞次数 1..n を短い順に補間する。`f_min` は説明用の「効いている次数」であり、確率は全次数を混ぜる（長い一致だけ見て unigram に飛ばさない）
-- 平滑化: 既定は Witten-Bell（`λ = N/(N+T)`）。`--smoothing kn` で絶対割引 KN。いずれも下位分布への補間
+- 平滑化: 既定は Witten-Bell（`λ = N/(N+T)`）。`--smoothing kn` で modified Kneser-Ney（Chen-Goodman の D1/D2/D3+）。いずれも下位分布への補間。KenLM 本体・ARPA は使わない
 - サンプリング: 分布ごとに alias 法を前計算し O(1) 抽選。温度パラメータで分布を変形
 - 停止: 文末トークンの明示 + 最大長ガード
+- 疎な文脈だけ skip-gram（直前を一つ飛ばした次数）と recency cache を混ぜる
 
 ### 4.4 選択器
 
@@ -163,6 +164,9 @@ LLMを使わず、理解せずに会話が成立する対話プログラムを�
 | mix | 候補の混ぜ方 `pool` / `exclusive` | pool |
 | n_retrieve | プールに入れる過去ボット発話 | 4 |
 | mmr_lambda | 検索 MMR の λ | 0.75 |
+| lambda_skip | 疎な文脈での skip-gram 混合 | 0.12 |
+| lambda_cache | 疎な文脈での recency cache 混合 | 0.10 |
+| ppm_exclude | Witten-Bell に PPM-C 除外を足す。KN は常に除外 | false |
 | echo_penalty | エコーの余弦減点 | 0.25 |
 | rote_penalty | 入力との連続部分列減点 | 0.50 |
 | band_penalty | 帯域外ヒンジの重み | 0.50 |
@@ -213,7 +217,7 @@ perplexity 最小化を目的関数にするとログ再現に向かい、無脳
 | インターフェース | `munou-engine` + `munou` CLI。観察窓（`munou observe` / `/observe`）が本線 | 設計 2.1。伺か / Misskey / 常駐は後段 |
 | トークナイザー | ゼロ設計: 双方向分岐エントロピー。弱いモデル時は CJK を文字単位 | 「閉じている」と最も整合。文節の代わりに統計チャンク |
 | embedding | 閉じた特徴ハッシュ (char n-gram、次数に比例した重み → dim 256)。`Embedder` trait | 単グラムがベクトルを占めないようにした |
-| 平滑化 | `Smoothing` trait。既定は Witten-Bell。`--smoothing kn` で絶対割引 KN。次数は短い順に補間 | 長い n-gram だけ見て unigram に飛ばすと中間文脈が死ぬ |
+| 平滑化 | `Smoothing` trait。既定は Witten-Bell。`--smoothing kn` は modified KN（コーパスの bigram 頻度から D1/D2/D3+）。次数は短い順に補間。KN 経路は PPM-C 除外 | 長い n-gram だけ見て unigram に飛ばすと中間文脈が死ぬ。KenLM は入れない |
 | 再現性 | `ChaCha8Rng` + シード。壁時計はログの `t` にしか使わない | |
 | 耐障害 | `munou-data/log.jsonl` を append + `sync_data`。インデックスはログから再構築 | mmap コールドスタートは未実装 |
 | 評価 | 帯域ヒット率 + 既存発話との連続部分列。`/eval`。帯域は選択器のヒンジにも使う | 面白さの定式化は open のまま。ヒンジは区間制約の凸緩和 |
@@ -247,3 +251,16 @@ LLM は使わない。エコシステム（API、Hub、重み、チャット製�
 外部コーパスは使わない。増やすのはシードと同じ生活ログの型（散歩・コーヒー・猫・仕事・ゲーム・挨拶）だけ。`unique_frac=0` なら語彙はほぼ増えず、発話数と SA 長だけが伸びる。それが「同じ人と長く話した」に近い。
 
 検索は全 bot 発話の埋め込みを毎ターン取ると O(N) になるので、既定は直近 1024 件だけ見る。`--retrieve-scan 0` で全件に戻せる。
+
+## v0.1.7 古典 LM の逆輸入
+
+KenLM も word2vec も PPM 圧縮器も入れない。借りるのは次数と割引の形だけ。生成器は接尾辞配列のまま。
+
+| 古典 LM 側の語 | munou の写し | 使っていないもの |
+|---|---|---|
+| Modified Kneser-Ney | `--smoothing kn`。bigram の count-of-counts から Chen-Goodman の D1/D2/D3+。λ = (n1·D1+n2·D2+n3+·D3)/N | SRILM、ARPA ファイル |
+| KenLM | SA がトライ相当。`NextMemo` が probing 相当。割引は上の MKN | `kenlm` クレート、lmplz、mmap バイナリ |
+| 可変長 n-gram / PPM / context tree | SA が任意長文脈。短い順に補間。KN 経路は PPM-C 除外（長い次数で見た型を下位から除く）。`--ppm` で Witten-Bell にも除外 | PPM* 圧縮、明示的な context-tree ノード |
+| Skip-gram cache LM | 疎な文脈だけ、直前を一つ飛ばした次数と直近 12 トークンの unigram cache を混ぜる（`lambda_skip` / `lambda_cache`） | word2vec skip-gram、ニューラル cache |
+
+既定の平滑化は Witten-Bell。最長一致が `f_min` 以上なら skip/cache は混ぜない（丸暗記テストを壊さない）。`kn_discount=0` は割引オフ（soak のアブレーション）。シード 50 発話は変わらない。
