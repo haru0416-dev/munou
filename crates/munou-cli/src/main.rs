@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use munou_engine::{Engine, OpenConfig, Params, SmoothingKind};
+use munou_engine::{Engine, MixMode, OpenConfig, Params, SmoothingKind};
 
 mod probe;
 mod verify;
@@ -69,7 +69,7 @@ enum Command {
         /// Trigger dictionary. Defaults to `data/triggers.example.json` if present.
         #[arg(long)]
         triggers: Option<PathBuf>,
-        /// RNG seed. Same log + same seed → identical probe replies.
+        /// RNG seed. Same log + same seed → identical replies.
         #[arg(long, default_value_t = 1)]
         rng_seed: u64,
         /// Slip injection probability (0 keeps the table readable).
@@ -101,6 +101,9 @@ struct Common {
     /// Smoothing: naive | kn
     #[arg(long)]
     smoothing: Option<String>,
+    /// Candidate mix: pool (default) | exclusive (v0.1 XOR)
+    #[arg(long)]
+    mix: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -183,6 +186,12 @@ fn params_from(c: &Common) -> Params {
             _ => SmoothingKind::Naive,
         };
     }
+    if let Some(m) = &c.mix {
+        p.mix = match m.to_ascii_lowercase().as_str() {
+            "exclusive" | "xor" => MixMode::Exclusive,
+            _ => MixMode::Pool,
+        };
+    }
     p
 }
 
@@ -233,7 +242,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             "/quit" | "/exit" => break,
             "/why" => {
                 if let Some(tr) = e.last_trace() {
-                    print!("{}", tr.explain_text());
+                    print!("{}", tr.trace.explain_text());
                 } else {
                     writeln!(stdout, "(no trace yet)")?;
                 }
