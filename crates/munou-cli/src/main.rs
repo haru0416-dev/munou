@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use munou_engine::{Engine, OpenConfig, Params, SmoothingKind};
 
+mod probe;
 mod verify;
 
 #[derive(Parser, Debug)]
@@ -59,6 +60,21 @@ enum Command {
         sa_tokens: usize,
         #[arg(long, default_value_t = 200)]
         turns: usize,
+    },
+    /// Load a seed conversation log and print empty-vs-grown numbers.
+    Probe {
+        /// Seed JSONL (`role` user/bot records). Copied to a temp dir; not mutated.
+        #[arg(long, default_value = "data/seed.jsonl")]
+        seed: PathBuf,
+        /// Trigger dictionary. Defaults to `data/triggers.example.json` if present.
+        #[arg(long)]
+        triggers: Option<PathBuf>,
+        /// RNG seed. Same log + same seed → identical probe replies.
+        #[arg(long, default_value_t = 1)]
+        rng_seed: u64,
+        /// Slip injection probability (0 keeps the table readable).
+        #[arg(long, default_value_t = 0.0)]
+        p_slip: f64,
     },
 }
 
@@ -130,6 +146,23 @@ fn main() -> Result<()> {
         }
         Command::Bench { tokens } => bench(tokens),
         Command::Verify { sa_tokens, turns } => verify::run(sa_tokens, turns),
+        Command::Probe {
+            seed,
+            triggers,
+            rng_seed,
+            p_slip,
+        } => {
+            let triggers = triggers.or_else(|| {
+                let p = PathBuf::from("data/triggers.example.json");
+                p.exists().then_some(p)
+            });
+            probe::run(probe::ProbeArgs {
+                seed,
+                triggers,
+                rng_seed,
+                p_slip,
+            })
+        }
     }
 }
 
