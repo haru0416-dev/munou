@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use munou_engine::{Engine, OpenConfig, Params, SmoothingKind};
 
+mod verify;
+
 #[derive(Parser, Debug)]
 #[command(name = "munou", about = "人工無脳君 — LLM を使わない対話エンジン")]
 struct Cli {
@@ -50,6 +52,13 @@ enum Command {
     Bench {
         #[arg(long, default_value_t = 1_000_000)]
         tokens: usize,
+    },
+    /// Run design-spec checks (determinism, trigger, slip, latency, SA).
+    Verify {
+        #[arg(long, default_value_t = 1_000_000)]
+        sa_tokens: usize,
+        #[arg(long, default_value_t = 200)]
+        turns: usize,
     },
 }
 
@@ -120,6 +129,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Bench { tokens } => bench(tokens),
+        Command::Verify { sa_tokens, turns } => verify::run(sa_tokens, turns),
     }
 }
 
