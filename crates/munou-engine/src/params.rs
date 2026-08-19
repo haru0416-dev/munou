@@ -17,6 +17,9 @@ pub struct Params {
     pub theta_trig: f32,
     /// Slip injection rate `p_slip`.
     pub p_slip: f64,
+    /// Probability of absorbing a live turn into the corpus (`p_learn`).
+    /// The JSONL log always appends; this only gates tokenizer / SA / retrieve.
+    pub p_learn: f64,
     /// Hard cap on generated chunks.
     pub max_gen_len: usize,
     /// Generation-buffer size (tokens) that triggers a full SA rebuild.
@@ -81,6 +84,7 @@ impl Default for Params {
             k_topic: 5,
             theta_trig: 0.42,
             p_slip: 0.15,
+            p_learn: 0.35,
             max_gen_len: 24,
             merge_threshold: 4096,
             entropy_n: 5,
