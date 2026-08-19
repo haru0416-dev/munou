@@ -5,7 +5,8 @@ v0.1 実装メモ — 同日
 v0.1.1 — 候補プール（トリガー / 検索 / マルコフ / エコー）  
 v0.1.2 — 対話中のランダム吸収 (`p_learn`)  
 v0.1.3 — 観察窓が本線。アダプタ（伺か / Misskey / 常駐）は劣後  
-v0.1.4 — 数理: 次数補間・Witten-Bell・帯域ヒンジ・Boltzmann slip・最長一致は連続部分列
+v0.1.4 — 数理: 次数補間・Witten-Bell・帯域ヒンジ・Boltzmann slip・最長一致は連続部分列  
+v0.1.5 — LLM エコシステムの**概念**を閉じた構造へ逆輸入。API・重み・HuggingFace は使わない
 
 本文は元ドラフト。末尾にこのリポジトリで固定した決定だけを足す。
 
@@ -217,8 +218,24 @@ perplexity 最小化を目的関数にするとログ再現に向かい、無脳
 | 評価 | 帯域ヒット率 + 既存発話との連続部分列。`/eval`。帯域は選択器のヒンジにも使う | 面白さの定式化は open のまま。ヒンジは区間制約の凸緩和 |
 | 候補 | 既定は `pool`。トリガー・検索・マルコフ・エコーが同時に提案し、選択器が選ぶ | XOR は `--mix exclusive`。対話行為プールはまだ |
 | 学習 | 既定 `p_learn=0.35`。会話ログは append-only、コーパス（SA / 検索 / トークナイザ統計）へは乱数で吸収。フラグは JSONL の `learned` | 毎回覚えるとおうむ返しに寄る。シードログはフィールド省略＝吸収済み |
-| 観察 | `Observe`。stage は発話・吸収・token 数。ゲージは吸収率・語彙・帯域ヒット・(1−rote)・slip。ボット行に `path` / `novelty_lcs` / `n_tok` を残し再開後も経路と eval が復元 | タマゴッチ型の感情モデルは足さない。HTML はローカルダンプのみ（サーバなし） |
+| 観察 | `Observe`。stage は発話・吸収・token 数。ゲージは吸収率・語彙・帯域ヒット・(1−rote)・slip。ボット行に `path` / `novelty_lcs` / `n_tok` を残し再開後も経路と eval が復元。記憶は作業（話題窓）/ 挿話（ログ）/ 母数（SA・語彙）の三層表示 | タマゴッチ型の感情モデルは足さない。HTML はローカルダンプのみ（サーバなし） |
+| 逆輸入 | LLM スタックの語彙だけ借りる。nucleus / 経路ゲート / 記憶層 / `/good` `/bad` 事前。生成は接尾辞配列のまま | OpenAI・HF hub・事前学習重み・MCP を製品にしない |
 
 実装順序 1–7 と、KN の差し替え口までが入っている。mmap / i8 量子化 / SIMD / 対話行為分類器 / 固有記憶はまだない。伺か SHIORI / Misskey / 常駐は意図的に後回し。
 
 v0.1 を設計書に突き合わせた記録は [`docs/verify.md`](verify.md)。再現は `munou verify`。
+
+## v0.1.5 LLM エコシステムの逆輸入
+
+LLM は使わない。エコシステム（API、Hub、重み、チャット製品）も直接は使わない。借りるのは**概念の形**だけ。閉じたデータ構造に写す。
+
+| LLM 側の語 | munou の写し | 使っていないもの |
+|---|---|---|
+| temperature / top-p / logprobs | `τ_gen`・`p_nucleus`（既定 1＝無効）・`k_top`・`GenStep.p`/`logp` | モデルロジット、OpenAI logprobs |
+| KV cache | `generate_one` 内の `next_counts` メモ | Transformer のキー値キャッシュ |
+| MoE / RAG vs weights | `route::plan` が検索枠とマルコフ枠を Cosine とストア占有から配分 | ニューラルルータ、外部検索 API |
+| MemGPT 記憶層 | 観察窓: 作業＝話題窓、挿話＝JSONL、母数＝SA/語彙 | ベクトル DB、クラウドメモリ |
+| RLHF / DPO | `/good` `/bad` → `path_prior[4]` を選択スコアへ加算。JSONL `role=meta` | 報酬モデル、選好データセット |
+| tool / MoE trace | `Trace.route` を `/why` に出す | function calling、外部ツール |
+
+既定の `p_nucleus=1` は次数補間の裾を落とさないため。`--top-p 0.9` で nucleus を足せる。好み行はコーパスに入らない。シード 50 発話は変わらない。
