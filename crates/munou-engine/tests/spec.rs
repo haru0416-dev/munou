@@ -141,6 +141,10 @@ fn explain_chain_is_complete() {
     assert!(!r.trace.candidates.is_empty());
     assert!(r.trace.candidates.iter().any(|c| c.chosen));
     assert!(r.trace.elapsed_us > 0);
+    assert!(
+        r.trace.route.is_some(),
+        "route line should be on every turn"
+    );
 }
 
 #[test]
@@ -460,11 +464,13 @@ fn observe_seed_shows_growth() {
     let o = e.observe();
     assert_eq!(o.learned, 50);
     assert_eq!(o.utterances, 50);
+    assert_eq!(o.meta, 0);
     assert!(o.absorb_rate > 0.99);
     assert_eq!(o.stage, munou_engine::Stage::Growing);
     let p = o.panel();
     assert!(p.contains("育ち"), "{p}");
     assert!(p.contains("吸収"), "{p}");
+    assert!(p.contains("記憶"), "{p}");
     assert!(!p.is_empty());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -523,5 +529,77 @@ fn observe_learn_ticks_and_path_survives_reopen() {
     assert!(o.path_known >= 1);
     assert!(o.eval_n >= 1, "eval must hydrate from JSONL scores");
     assert!(!o.panel().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn meta_good_is_not_corpus_and_restores_prior() {
+    let dir = tmp_dir("meta");
+    let log = dir.join("log.jsonl");
+    let params = Params {
+        p_learn: 1.0,
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let tokens;
+    let utterances;
+    let prior;
+    {
+        let mut e = Engine::open(OpenConfig {
+            params: params.clone(),
+            seed: 6,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        e.respond("ありがとう").unwrap();
+        tokens = e.stats().tokens;
+        utterances = e.stats().utterances;
+        e.feedback(true).unwrap();
+        assert_eq!(e.stats().tokens, tokens, "meta must not grow the SA");
+        assert_eq!(e.stats().utterances, utterances);
+        assert_eq!(e.stats().meta, 1);
+        prior = e.stats().path_prior;
+        assert!(prior.iter().any(|x| *x > 0.0));
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("\"role\":\"meta\""), "{raw}");
+        assert!(raw.contains("\"text\":\"good\""), "{raw}");
+    }
+    let e2 = Engine::open(OpenConfig {
+        params,
+        seed: 6,
+        log_path: Some(log.clone()),
+        triggers_path: None,
+    })
+    .unwrap();
+    assert_eq!(e2.stats().tokens, tokens);
+    assert_eq!(e2.stats().utterances, utterances);
+    assert_eq!(e2.stats().learned, utterances);
+    assert_eq!(e2.stats().meta, 1);
+    assert_eq!(e2.stats().path_prior, prior);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hybrid_pool_still_lists_echo_with_router() {
+    let dir = tmp_dir("echo-route");
+    let trig = dir.join("t.json");
+    fs::write(
+        &trig,
+        r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
+    )
+    .unwrap();
+    let mut e = Engine::ephemeral(Params::default(), 3).unwrap();
+    e.load_triggers(&trig).unwrap();
+    let r = e.respond("おはよう").unwrap();
+    assert_eq!(r.trace.path, PathKind::Trigger);
+    assert!(
+        r.trace
+            .candidates
+            .iter()
+            .any(|c| c.source == PathKind::Echo),
+        "router must not drop the echo expert from the pool"
+    );
+    assert!(r.trace.route.as_deref().unwrap_or("").contains("route"));
     let _ = fs::remove_dir_all(&dir);
 }
