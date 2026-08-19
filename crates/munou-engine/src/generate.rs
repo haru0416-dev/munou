@@ -1,4 +1,4 @@
-//! Markov generation over interned chunks, with longest-match backoff.
+//! Markov generation: interpolated variable-order n-grams over a suffix array.
 
 use rand::Rng;
 
@@ -8,8 +8,6 @@ use crate::ids::{TokenId, EOS};
 use crate::params::Params;
 use crate::smoothing::Smoothing;
 use crate::store::Store;
-
-type Sparse = (Vec<(TokenId, u32)>, u32, usize);
 
 #[derive(Debug, Clone)]
 pub struct Generated {
@@ -100,65 +98,39 @@ fn dist_with_backoff(
     } else {
         store.ml_unigram()
     };
-    let parrot_dist = parrot_unigram(parrot);
-
     let mut backoff = if unigram.is_empty() {
-        parrot_dist.clone()
+        parrot_unigram(parrot)
     } else {
         unigram
     };
 
+    // Interpolate every non-empty order, shortest suffix first.
+    // P_n = mix(counts(ctx[-n:]), P_{n-1}). Skipping to unigram was the
+    // previous bug: a long match threw away the intermediate n-grams.
     let mut used = 0usize;
     let mut freq = 0u32;
-    let mut local: Vec<(TokenId, u32)> = Vec::new();
-    let mut fallback: Option<Sparse> = None;
-
-    for start in 0..=ctx.len() {
-        let sub = &ctx[start..];
-        if sub.is_empty() {
+    for len in 1..=ctx.len() {
+        let sub = &ctx[ctx.len() - len..];
+        let (counts, total) = store.next_counts(sub);
+        if total == 0 {
             continue;
         }
-        let (counts, total) = store.next_counts(sub);
-        if total > 0 && fallback.is_none() {
-            fallback = Some((counts.clone(), total, sub.len()));
-        }
-        if total >= params.f_min {
-            local = counts;
+        let n1plus = counts.len() as u32;
+        backoff = smoothing.distribute(&counts, total, n1plus, &backoff);
+        if total >= params.f_min || freq < params.f_min {
+            used = len;
             freq = total;
-            used = sub.len();
-            fallback = None;
-            break;
-        }
-    }
-    if freq == 0 {
-        if let Some((c, t, u)) = fallback {
-            local = c;
-            freq = t;
-            used = u;
         }
     }
 
-    // Walk from long to short but we iterated start 0..=len (longest first). Good.
-    // If still empty, use unigram/parrot.
-    let n1plus = local.len() as u32;
-    let mixed = if freq > 0 {
-        smoothing.distribute(&local, freq, n1plus, &backoff)
-    } else {
-        std::mem::take(&mut backoff)
-    };
-
-    if mixed.is_empty() {
-        let pd = parrot_unigram(parrot);
-        if pd.is_empty() {
-            return (Vec::new(), Vec::new(), used, freq);
-        }
-        let ids: Vec<TokenId> = pd.iter().map(|(id, _)| *id).collect();
-        let w: Vec<f64> = pd.iter().map(|(_, p)| *p).collect();
-        return (ids, w, used, freq);
+    if backoff.is_empty() {
+        backoff = parrot_unigram(parrot);
     }
-
-    let ids: Vec<TokenId> = mixed.iter().map(|(id, _)| *id).collect();
-    let w: Vec<f64> = mixed.iter().map(|(_, p)| *p).collect();
+    if backoff.is_empty() {
+        return (Vec::new(), Vec::new(), used, freq);
+    }
+    let ids: Vec<TokenId> = backoff.iter().map(|(id, _)| *id).collect();
+    let w: Vec<f64> = backoff.iter().map(|(_, p)| *p).collect();
     (ids, w, used, freq)
 }
 
@@ -166,20 +138,23 @@ fn parrot_unigram(parrot: &[TokenId]) -> Vec<(TokenId, f64)> {
     if parrot.is_empty() {
         return Vec::new();
     }
-    let inv = 1.0 / parrot.len() as f64;
-    // unique-preserving order
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut out = Vec::new();
+    let mut counts: rustc_hash::FxHashMap<TokenId, u32> = rustc_hash::FxHashMap::default();
+    let mut order: Vec<TokenId> = Vec::new();
     for &t in parrot {
-        if seen.insert(t) {
-            let c = parrot.iter().filter(|x| **x == t).count() as f64;
-            out.push((t, c * inv));
+        let e = counts.entry(t).or_insert(0);
+        if *e == 0 {
+            order.push(t);
         }
+        *e += 1;
     }
-    out
+    let inv = 1.0 / parrot.len() as f64;
+    order
+        .into_iter()
+        .map(|id| (id, counts[&id] as f64 * inv))
+        .collect()
 }
 
-/// Longest common token subsequence length (novelty / rote-memorisation).
+/// Longest common token *subsequence* (can skip). Kept for tests / contrast.
 pub fn lcs_len(a: &[TokenId], b: &[TokenId]) -> usize {
     if a.is_empty() || b.is_empty() {
         return 0;
@@ -201,6 +176,29 @@ pub fn lcs_len(a: &[TokenId], b: &[TokenId]) -> usize {
     prev[x.len()]
 }
 
+/// Longest common *contiguous* token run. This is the design's 最長一致
+/// (rote copy). Subsequence LCS over-penalises Markov recombination.
+pub fn lcsubstr_len(a: &[TokenId], b: &[TokenId]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let (x, y) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let mut prev = vec![0usize; x.len() + 1];
+    let mut cur = vec![0usize; x.len() + 1];
+    let mut best = 0usize;
+    for &by in y {
+        for (i, &ax) in x.iter().enumerate() {
+            cur[i + 1] = if ax == by { prev[i] + 1 } else { 0 };
+            if cur[i + 1] > best {
+                best = cur[i + 1];
+            }
+        }
+        std::mem::swap(&mut prev, &mut cur);
+        cur.fill(0);
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +211,14 @@ mod tests {
     fn lcs_simple() {
         assert_eq!(lcs_len(&[1, 2, 3], &[2, 3, 4]), 2);
         assert_eq!(lcs_len(&[1], &[2]), 0);
+    }
+
+    #[test]
+    fn lcsubstr_is_contiguous_not_subsequence() {
+        assert_eq!(lcsubstr_len(&[1, 2, 3, 4], &[1, 3, 4]), 2);
+        assert_eq!(lcs_len(&[1, 2, 3, 4], &[1, 3, 4]), 3);
+        assert_eq!(lcsubstr_len(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(lcsubstr_len(&[7], &[8]), 0);
     }
 
     #[test]
@@ -249,5 +255,44 @@ mod tests {
         assert!(!g.steps.is_empty());
         assert!(g.steps[0].ctx_len_used >= 2);
         assert!(g.steps[0].freq >= 3);
+    }
+
+    #[test]
+    fn interpolation_leaks_mass_from_shorter_context() {
+        // [a,x] is common; [b,a,y] is the only long match. Unigram of x is
+        // drowned by many [z]. Recursive mix should still see P(x|a) ≈ 1
+        // and leak x into P(·|b,a). Jumping to unigram would not.
+        let mut store = Store::new(32);
+        let (a, x, b, y, z) = (20u32, 21, 22, 23, 24);
+        for _ in 0..20 {
+            store.push_utterance(&[a, x]);
+        }
+        for _ in 0..3 {
+            store.push_utterance(&[b, a, y]);
+        }
+        for _ in 0..80 {
+            store.push_utterance(&[z, z]);
+        }
+        store.merge();
+        let params = Params {
+            f_min: 3,
+            l_max: 8,
+            max_gen_len: 1,
+            tau_gen: 1.0,
+            ..Params::default()
+        };
+        let smoothing = NaiveBackoff;
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let mut hit_x = 0;
+        for _ in 0..200 {
+            let g = generate_one(&store, &smoothing, &params, &[b, a], &[], &mut rng);
+            if g.tokens.first() == Some(&x) {
+                hit_x += 1;
+            }
+        }
+        assert!(
+            hit_x >= 8,
+            "interpolated P(x|b,a) should leak from P(x|a); hit_x={hit_x}/200"
+        );
     }
 }

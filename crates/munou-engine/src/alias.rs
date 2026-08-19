@@ -83,6 +83,24 @@ impl AliasTable {
             self.alias[i]
         }
     }
+
+    /// Boltzmann weights: `exp((s_i - max)/τ)`. Numerically stable.
+    pub fn softmax_weights(scores: &[f64], tau: f64) -> Vec<f64> {
+        if scores.is_empty() {
+            return Vec::new();
+        }
+        let tau = tau.max(1e-6);
+        let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if !m.is_finite() {
+            return vec![1.0; scores.len()];
+        }
+        scores.iter().map(|s| ((s - m) / tau).exp()).collect()
+    }
+
+    pub fn softmax_sample<R: Rng + ?Sized>(scores: &[f64], tau: f64, rng: &mut R) -> usize {
+        let w = Self::softmax_weights(scores, tau);
+        Self::from_weights(&w).sample(rng)
+    }
 }
 
 /// Apply temperature `τ`: `p_i^{1/τ}` then renormalise. `τ == 1` is identity.
@@ -127,5 +145,13 @@ mod tests {
         let mut w = [0.2, 0.8];
         temper(&mut w, 1.0);
         assert!((w[0] - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn softmax_peaks_on_max() {
+        let w = AliasTable::softmax_weights(&[0.0, 2.0, 0.0], 0.5);
+        assert!(w[1] > w[0] && w[1] > w[2]);
+        let z: f64 = w.iter().sum();
+        assert!(z > 0.0);
     }
 }
