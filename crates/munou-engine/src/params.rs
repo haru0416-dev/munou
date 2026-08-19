@@ -61,6 +61,14 @@ pub struct Params {
     pub retrieve_penalty: f32,
     /// MMR λ for retrieve: λ·sim − (1−λ)·max redundancy. 1 = top-k cosine.
     pub mmr_lambda: f32,
+    /// Nucleus mass `p`. 1 = keep the full distribution.
+    pub p_nucleus: f64,
+    /// Decode top-k. 0 = off.
+    pub k_top: usize,
+    /// `/good` `/bad` step on the last path prior.
+    pub pref_step: f32,
+    /// Clamp on each path prior.
+    pub pref_clip: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +120,10 @@ impl Default for Params {
             trigger_match_weight: 1.0,
             retrieve_penalty: 0.20,
             mmr_lambda: 0.75,
+            p_nucleus: 1.0,
+            k_top: 0,
+            pref_step: 0.08,
+            pref_clip: 0.35,
         }
     }
 }

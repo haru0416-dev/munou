@@ -12,6 +12,8 @@ use crate::explain::PathKind;
 pub enum Role {
     User,
     Bot,
+    /// Preference / control line. Not dialogue, not corpus. Closed analog of RLHF labels.
+    Meta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
