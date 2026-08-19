@@ -115,12 +115,21 @@ struct Common {
     /// Generation temperature.
     #[arg(long)]
     tau: Option<f64>,
+    /// Slip Boltzmann temperature (ranks ≥ 2).
+    #[arg(long)]
+    tau_slip: Option<f64>,
+    /// Band-hinge weight on the selector.
+    #[arg(long)]
+    band_penalty: Option<f32>,
     /// Smoothing: naive | kn
     #[arg(long)]
     smoothing: Option<String>,
     /// Candidate mix: pool (default) | exclusive (v0.1 XOR)
     #[arg(long)]
     mix: Option<String>,
+    /// MMR λ for retrieve: λ·sim − (1−λ)·max redundancy. 1 = top-k cosine.
+    #[arg(long)]
+    mmr: Option<f32>,
 }
 
 fn main() -> Result<()> {
@@ -210,6 +219,15 @@ fn params_from(c: &Common) -> Params {
     }
     if let Some(t) = c.tau {
         p.tau_gen = t.max(1e-3);
+    }
+    if let Some(t) = c.tau_slip {
+        p.tau_slip = t.max(1e-3);
+    }
+    if let Some(b) = c.band_penalty {
+        p.band_penalty = b.max(0.0);
+    }
+    if let Some(m) = c.mmr {
+        p.mmr_lambda = m.clamp(0.0, 1.0);
     }
     if let Some(s) = &c.smoothing {
         p.smoothing = match s.to_ascii_lowercase().as_str() {
