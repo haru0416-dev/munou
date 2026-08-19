@@ -193,6 +193,20 @@ fn kn_smoothing_responds() {
 }
 
 #[test]
+fn skip_cache_ppm_flags_respond() {
+    let params = Params {
+        smoothing: munou_engine::SmoothingKind::Kn,
+        ppm_exclude: true,
+        lambda_skip: 0.5,
+        lambda_cache: 0.4,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 11).unwrap();
+    let r = e.respond("とばした文脈とキャッシュ").unwrap();
+    assert!(!r.text.is_empty());
+}
+
+#[test]
 fn trigger_dict_parses_example() {
     let p =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/triggers.example.json");
@@ -231,6 +245,7 @@ fn cargo_lock_has_no_network_or_llm_crates() {
         "tokio",
         "tract-core",
         "ureq",
+        "kenlm",
     ];
     for line in lock.lines() {
         let line = line.trim();
