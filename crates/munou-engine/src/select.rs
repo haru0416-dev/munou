@@ -1,9 +1,10 @@
-//! Candidate ranking by topic cosine, with intentional slip injection.
+//! Candidate ranking by topic cosine, source priors, and anti-parrot LCS.
 
 use rand::Rng;
 
 use crate::embed::{cosine, Embedder};
-use crate::explain::CandidateTrace;
+use crate::explain::{CandidateTrace, PathKind};
+use crate::generate::lcs_len;
 use crate::ids::TokenId;
 use crate::params::Params;
 
@@ -15,31 +16,53 @@ pub struct Ranked {
     pub traces: Vec<CandidateTrace>,
 }
 
+pub struct RankInput<'a> {
+    pub topic: &'a [f32],
+    pub texts: &'a [String],
+    pub tokens: &'a [Vec<TokenId>],
+    pub sources: &'a [PathKind],
+    pub input_tokens: &'a [TokenId],
+    /// Pattern-input cosine of the trigger hit, or 0.
+    pub trigger_match: f32,
+}
+
+pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32 {
+    match source {
+        PathKind::Trigger => params.trigger_bonus + params.trigger_match_weight * trigger_match,
+        PathKind::Markov => 0.0,
+        PathKind::Retrieve => -params.retrieve_penalty,
+        PathKind::Echo => -params.echo_penalty,
+    }
+}
+
 pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
     embedder: &E,
-    topic: &[f32],
-    texts: &[String],
-    tokens: &[Vec<TokenId>],
+    input: RankInput<'_>,
     params: &Params,
     rng: &mut R,
 ) -> Ranked {
     let dim = embedder.dim();
     let mut buf = vec![0.0f32; dim];
-    let mut scored: Vec<(usize, f32)> = Vec::with_capacity(texts.len());
-    for (i, t) in texts.iter().enumerate() {
+    let mut scored: Vec<(usize, f32, f32)> = Vec::with_capacity(input.texts.len());
+    for (i, t) in input.texts.iter().enumerate() {
         embedder.embed(t, &mut buf);
-        scored.push((i, cosine(topic, &buf)));
+        let topic_s = cosine(input.topic, &buf);
+        let source = input.sources.get(i).copied().unwrap_or(PathKind::Markov);
+        let toks = input.tokens.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
+        let denom = toks.len().max(1) as f32;
+        let rote = params.rote_penalty * (lcs_len(toks, input.input_tokens) as f32 / denom);
+        let score = topic_s + source_bias(source, params, input.trigger_match) - rote;
+        scored.push((i, score, topic_s));
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let slip_roll: f64 = rng.gen();
     let slipped = slip_roll < params.p_slip && scored.len() >= 2;
     let chosen_rank = if slipped {
-        // sample among 2nd..last, weighted by shifted cosine
         let rest = &scored[1..];
         let mut w: Vec<f64> = rest
             .iter()
-            .map(|(_, s)| (*s as f64 + 1.0).max(1e-6))
+            .map(|(_, s, _)| (*s as f64 + 1.0).max(1e-6))
             .collect();
         let z: f64 = w.iter().sum();
         if z > 0.0 {
@@ -57,10 +80,12 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
     let traces = scored
         .iter()
         .enumerate()
-        .map(|(rank, (i, score))| CandidateTrace {
+        .map(|(rank, (i, score, topic_s))| CandidateTrace {
             rank,
-            text: texts[*i].clone(),
-            tokens: tokens.get(*i).cloned().unwrap_or_default(),
+            source: input.sources.get(*i).copied().unwrap_or(PathKind::Markov),
+            text: input.texts[*i].clone(),
+            tokens: input.tokens.get(*i).cloned().unwrap_or_default(),
+            topic_score: *topic_s,
             score: *score,
             chosen: *i == index,
         })
@@ -88,13 +113,59 @@ mod tests {
         e.embed("天気は晴れ", &mut topic);
         let texts = vec!["今日は晴れだね".into(), "xml hashing".into()];
         let toks = vec![vec![1], vec![2]];
+        let sources = vec![PathKind::Markov, PathKind::Markov];
+        let params = Params {
+            p_slip: 0.0,
+            rote_penalty: 0.0,
+            ..Params::default()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let r = rank_and_pick(
+            &e,
+            RankInput {
+                topic: &topic,
+                texts: &texts,
+                tokens: &toks,
+                sources: &sources,
+                input_tokens: &[],
+                trigger_match: 0.0,
+            },
+            &params,
+            &mut rng,
+        );
+        assert!(!r.slipped);
+        assert_eq!(r.traces[0].text, "今日は晴れだね");
+    }
+
+    #[test]
+    fn echo_loses_to_on_topic_despite_copying_input() {
+        let e = HashEmbedder::new(64);
+        let mut topic = vec![0.0; 64];
+        e.embed("おはよう", &mut topic);
+        let texts = vec!["おはよう".into(), "おはよ・テスト応答".into()];
+        let toks = vec![vec![7, 8], vec![9]];
+        let sources = vec![PathKind::Echo, PathKind::Trigger];
         let params = Params {
             p_slip: 0.0,
             ..Params::default()
         };
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let r = rank_and_pick(&e, &topic, &texts, &toks, &params, &mut rng);
-        assert!(!r.slipped);
-        assert_eq!(r.traces[0].text, "今日は晴れだね");
+        let r = rank_and_pick(
+            &e,
+            RankInput {
+                topic: &topic,
+                texts: &texts,
+                tokens: &toks,
+                sources: &sources,
+                input_tokens: &[7, 8],
+                trigger_match: 1.0,
+            },
+            &params,
+            &mut rng,
+        );
+        assert_eq!(
+            r.traces.iter().find(|c| c.chosen).unwrap().source,
+            PathKind::Trigger
+        );
     }
 }
