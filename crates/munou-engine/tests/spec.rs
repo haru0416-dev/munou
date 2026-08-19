@@ -431,3 +431,97 @@ fn p_learn_skip_survives_reopen() {
     assert!(e2.stats().utterances >= 2);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn observe_empty_is_empty_stage() {
+    let e = Engine::ephemeral(Params::default(), 1).unwrap();
+    let o = e.observe();
+    assert_eq!(o.stage, munou_engine::Stage::Empty);
+    let p = o.panel();
+    assert!(p.contains("空"), "{p}");
+    assert!(p.contains("観察窓"), "{p}");
+    assert!(!p.is_empty());
+    assert!(o.strip().contains("観察"));
+}
+
+#[test]
+fn observe_seed_shows_growth() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let seed = root.join("data/seed.jsonl");
+    let dir = tmp_dir("obs-seed");
+    fs::copy(&seed, dir.join("log.jsonl")).unwrap();
+    let e = Engine::open(OpenConfig {
+        params: Params::default(),
+        seed: 1,
+        log_path: Some(dir.join("log.jsonl")),
+        triggers_path: None,
+    })
+    .unwrap();
+    let o = e.observe();
+    assert_eq!(o.learned, 50);
+    assert_eq!(o.utterances, 50);
+    assert!(o.absorb_rate > 0.99);
+    assert_eq!(o.stage, munou_engine::Stage::Growing);
+    let p = o.panel();
+    assert!(p.contains("育ち"), "{p}");
+    assert!(p.contains("吸収"), "{p}");
+    assert!(!p.is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn observe_p_learn_zero_is_logged_stage() {
+    let params = Params {
+        p_learn: 0.0,
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 1).unwrap();
+    e.respond("ありがとう").unwrap();
+    let o = e.observe();
+    assert_eq!(o.stage, munou_engine::Stage::Logged);
+    assert_eq!(o.learned, 0);
+    assert!(o.utterances >= 2);
+    assert!(o.panel().contains("記録中"));
+}
+
+#[test]
+fn observe_learn_ticks_and_path_survives_reopen() {
+    let dir = tmp_dir("obs-learn");
+    let log = dir.join("log.jsonl");
+    let params = Params {
+        p_learn: 1.0,
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    {
+        let mut e = Engine::open(OpenConfig {
+            params: params.clone(),
+            seed: 4,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        assert_eq!(e.observe().learned, 0);
+        let r = e.respond("hello kitty").unwrap();
+        assert!(r.trace.learned);
+        assert!(e.observe().learned >= 2);
+        assert!(e.observe().path_known >= 1);
+        assert_eq!(e.observe().last_path, Some(r.trace.path));
+    }
+    let raw = fs::read_to_string(&log).unwrap();
+    assert!(raw.contains("\"path\":"), "bot path must be written: {raw}");
+    let e2 = Engine::open(OpenConfig {
+        params,
+        seed: 4,
+        log_path: Some(log.clone()),
+        triggers_path: None,
+    })
+    .unwrap();
+    let o = e2.observe();
+    assert!(o.learned >= 2);
+    assert!(o.path_known >= 1);
+    assert!(o.eval_n >= 1, "eval must hydrate from JSONL scores");
+    assert!(!o.panel().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
