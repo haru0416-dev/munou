@@ -20,6 +20,11 @@ pub struct Store {
     unigram: FxHashMap<TokenId, u32>,
     /// Continuation counts: number of unique left contexts per token (KN unigram).
     continuation: FxHashMap<TokenId, u32>,
+    /// Bigram count-of-counts n1..n4 for Chen-Goodman modified KN.
+    bigram_n1: u64,
+    bigram_n2: u64,
+    bigram_n3: u64,
+    bigram_n4: u64,
     merge_threshold: usize,
 }
 
@@ -81,21 +86,56 @@ impl Store {
     fn recompute_stats(&mut self) {
         self.unigram.clear();
         self.continuation.clear();
+        self.bigram_n1 = 0;
+        self.bigram_n2 = 0;
+        self.bigram_n3 = 0;
+        self.bigram_n4 = 0;
         for &t in self.text.iter().chain(self.buf.iter()) {
             *self.unigram.entry(t).or_insert(0) += 1;
         }
         // unique left contexts of each token in the body
         let mut seen: FxHashMap<TokenId, FxHashMap<TokenId, ()>> = FxHashMap::default();
         let stream: Vec<TokenId> = self.text.iter().chain(self.buf.iter()).copied().collect();
+        let mut bigrams: FxHashMap<(TokenId, TokenId), u32> = FxHashMap::default();
         for i in 1..stream.len() {
             let left = stream[i - 1];
             let w = stream[i];
             seen.entry(w).or_default().insert(left, ());
+            *bigrams.entry((left, w)).or_insert(0) += 1;
         }
         self.continuation = seen
             .into_iter()
             .map(|(w, lefts)| (w, lefts.len() as u32))
             .collect();
+        for &c in bigrams.values() {
+            match c {
+                1 => self.bigram_n1 += 1,
+                2 => self.bigram_n2 += 1,
+                3 => self.bigram_n3 += 1,
+                4 => self.bigram_n4 += 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// Chen-Goodman D1/D2/D3+ from this corpus. Not an ARPA / KenLM file.
+    pub fn mkn_discounts(&self, fallback: f64) -> (f64, f64, f64) {
+        crate::smoothing::chen_goodman(
+            self.bigram_n1,
+            self.bigram_n2,
+            self.bigram_n3,
+            self.bigram_n4,
+            fallback,
+        )
+    }
+
+    pub fn bigram_count_of_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.bigram_n1,
+            self.bigram_n2,
+            self.bigram_n3,
+            self.bigram_n4,
+        )
     }
 
     /// Next-token counts for an exact context, combining SA body and buffer.
@@ -215,5 +255,29 @@ mod tests {
         assert!(total >= 2);
         let ids: Vec<TokenId> = c.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&12) || ids.contains(&13));
+    }
+
+    #[test]
+    fn mkn_discounts_increase_with_count_bin() {
+        let mut s = Store::new(32);
+        for i in 0..40u32 {
+            s.push_utterance(&[100, 200 + i]);
+        }
+        for _ in 0..8 {
+            s.push_utterance(&[10, 11]);
+        }
+        for _ in 0..3 {
+            s.push_utterance(&[12, 13]);
+        }
+        for _ in 0..2 {
+            s.push_utterance(&[14, 15]);
+        }
+        s.merge();
+        let (n1, n2, n3, n4) = s.bigram_count_of_counts();
+        assert!(n1 > 0 && n2 > 0, "n1={n1} n2={n2} n3={n3} n4={n4}");
+        let (d1, d2, d3) = s.mkn_discounts(0.75);
+        assert!((0.05..=0.95).contains(&d1), "d1={d1}");
+        assert!((0.05..=1.95).contains(&d2), "d2={d2}");
+        assert!((0.05..=2.95).contains(&d3), "d3={d3}");
     }
 }
