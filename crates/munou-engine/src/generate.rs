@@ -204,10 +204,50 @@ pub fn lcs_len(a: &[TokenId], b: &[TokenId]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoothing::NaiveBackoff;
+    use crate::store::Store;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
 
     #[test]
     fn lcs_simple() {
         assert_eq!(lcs_len(&[1, 2, 3], &[2, 3, 4]), 2);
         assert_eq!(lcs_len(&[1], &[2]), 0);
+    }
+
+    #[test]
+    fn longest_match_continues_observed_ngram() {
+        let mut store = Store::new(32);
+        let a = 20;
+        let b = 21;
+        let c = 22;
+        for _ in 0..8 {
+            store.push_utterance(&[a, b, c]);
+        }
+        store.merge();
+        let params = Params {
+            f_min: 3,
+            l_max: 8,
+            max_gen_len: 1,
+            tau_gen: 1.0,
+            ..Params::default()
+        };
+        let smoothing = NaiveBackoff;
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let mut hit = 0;
+        for _ in 0..40 {
+            let g = generate_one(&store, &smoothing, &params, &[a, b], &[], &mut rng);
+            if g.tokens.first() == Some(&c) {
+                hit += 1;
+            }
+        }
+        assert!(
+            hit >= 36,
+            "expected continuation 黄 after 赤青; hit={hit}/40"
+        );
+        let g = generate_one(&store, &smoothing, &params, &[a, b], &[], &mut rng);
+        assert!(!g.steps.is_empty());
+        assert!(g.steps[0].ctx_len_used >= 2);
+        assert!(g.steps[0].freq >= 3);
     }
 }
