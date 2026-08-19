@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::collections::BTreeSet;
 
 use anyhow::{bail, Context, Result};
-use munou_engine::{Engine, OpenConfig, Params, PathKind};
+use munou_engine::{Engine, OpenConfig, Params, PathKind, Stage};
 
 const DEFAULT_PROMPTS: &[&str] = &[
     "おはよう",
@@ -43,8 +43,10 @@ struct Row {
 
 struct Run {
     utterances: usize,
+    learned: usize,
     tokens: usize,
     vocab: usize,
+    stage: Stage,
     rows: Vec<Row>,
 }
 
@@ -126,11 +128,14 @@ fn path_tag(p: PathKind) -> &'static str {
 fn run_on(log: PathBuf, args: &ProbeArgs, prompts: &[&str]) -> Result<Run> {
     let mut engine = open_engine(log, args, params(args))?;
     let st = engine.stats();
+    let obs = engine.observe();
     let rows = collect(&mut engine, prompts)?;
     Ok(Run {
         utterances: st.utterances,
+        learned: obs.learned,
         tokens: st.tokens,
         vocab: st.vocab,
+        stage: obs.stage,
         rows,
     })
 }
@@ -181,12 +186,12 @@ pub fn run(args: ProbeArgs) -> Result<()> {
         DEFAULT_PROMPTS.len()
     );
     println!(
-        "corpus  empty: utterances={} tokens={} vocab={}",
-        empty.utterances, empty.tokens, empty.vocab
+        "corpus  empty: utterances={} tokens={} vocab={} stage={:?}",
+        empty.utterances, empty.tokens, empty.vocab, empty.stage
     );
     println!(
-        "corpus  seed : utterances={} tokens={} vocab={}",
-        seeded.utterances, seeded.tokens, seeded.vocab
+        "corpus  seed : utterances={} learned={} tokens={} vocab={} stage={:?}",
+        seeded.utterances, seeded.learned, seeded.tokens, seeded.vocab, seeded.stage
     );
     println!();
     println!(
@@ -310,6 +315,14 @@ pub fn run(args: ProbeArgs) -> Result<()> {
         "grow-utterances",
         seeded.utterances == 50,
         format!("seed utterances={} (want 50)", seeded.utterances),
+    );
+    check(
+        "observe-seed",
+        seeded.stage == Stage::Growing && seeded.learned == 50,
+        format!(
+            "stage={:?} learned={} (want Growing / 50)",
+            seeded.stage, seeded.learned
+        ),
     );
     check(
         "diverge",
