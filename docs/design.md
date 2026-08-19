@@ -191,3 +191,5 @@ perplexity 最小化を目的関数にするとログ再現に向かい、無脳
 | 評価 | 帯域ヒット率 + 既存発話との token LCS。`/eval` | 面白さの定式化は open のまま |
 
 実装順序 1–5 と、KN の差し替え口までが入っている。mmap / i8 量子化 / SIMD / 対話行為分類器 / 固有記憶はまだない。
+
+v0.1 を設計書に突き合わせた記録は [`docs/verify.md`](verify.md)。再現は `munou verify`。
