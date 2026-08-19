@@ -237,8 +237,20 @@ pub fn run(args: ProbeArgs) -> Result<()> {
     }
 
     let n = seeded.rows.len();
-    let empty_ctx = mean(empty.rows.iter().map(|r| r.ctx_used as f64));
-    let seed_ctx = mean(seeded.rows.iter().map(|r| r.ctx_used as f64));
+    let empty_ctx = mean(
+        empty
+            .rows
+            .iter()
+            .filter(|r| r.path == PathKind::Markov)
+            .map(|r| r.ctx_used as f64),
+    );
+    let seed_ctx = mean(
+        seeded
+            .rows
+            .iter()
+            .filter(|r| r.path == PathKind::Markov)
+            .map(|r| r.ctx_used as f64),
+    );
     let empty_sim = mean(empty.rows.iter().map(|r| r.sim as f64));
     let seed_sim = mean(seeded.rows.iter().map(|r| r.sim as f64));
     let seed_lcs = mean(seeded.rows.iter().map(|r| {
@@ -332,7 +344,7 @@ pub fn run(args: ProbeArgs) -> Result<()> {
     check(
         "ctx-grows",
         seed_ctx + 1e-9 >= empty_ctx,
-        format!("mean ctx empty={empty_ctx:.2} seed={seed_ctx:.2}"),
+        format!("Markov-only mean ctx empty={empty_ctx:.2} seed={seed_ctx:.2}"),
     );
     check(
         "trigger-ohayo",
