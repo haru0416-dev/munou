@@ -170,7 +170,9 @@ impl Engine {
 
         if texts.is_empty() {
             path = PathKind::Markov;
-            let ctx_seed: Vec<TokenId> = self.history.iter().copied().collect();
+            // Longest-match context is recent history plus the current user chunks.
+            let mut ctx_seed: Vec<TokenId> = self.history.iter().copied().collect();
+            ctx_seed.extend_from_slice(&tok.chunks);
             let parrot = tok.chunks.clone();
             let mut seen = FxHashSet::default();
             let mut attempts = 0;
@@ -209,8 +211,13 @@ impl Engine {
                 texts.push(text);
             }
             if texts.is_empty() {
-                let parrot_text = detokenize(&tok.chunk_strs);
-                let shuffled = parrot_variant(&tok.chunk_strs, &mut self.rng);
+                let parrot_strs: Vec<String> = tok
+                    .chunks
+                    .iter()
+                    .map(|id| self.intern.get(*id).to_string())
+                    .collect();
+                let parrot_text = detokenize(&parrot_strs);
+                let shuffled = parrot_variant(&parrot_strs, &mut self.rng);
                 texts.push(shuffled);
                 toks.push(tok.chunks.clone());
                 if parrot_text != texts[0] {
@@ -262,8 +269,16 @@ impl Engine {
             seed: self.seed,
             path,
             input: input.to_string(),
-            morphemes: tok.morph_strs,
-            chunks: tok.chunk_strs,
+            morphemes: tok
+                .morphemes
+                .iter()
+                .map(|id| self.intern.get(*id).to_string())
+                .collect(),
+            chunks: tok
+                .chunks
+                .iter()
+                .map(|id| self.intern.get(*id).to_string())
+                .collect(),
             topic_hits: self.topic.len(),
             trigger: trigger_tr,
             candidates: ranked.traces,
@@ -348,6 +363,23 @@ impl Engine {
 
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// One Markov draw without embedding, logging, or topic update.
+    /// Used by `munou verify` to isolate engine-path latency from hash-embed.
+    pub fn markov_draw(&mut self) -> usize {
+        let ctx: Vec<TokenId> = self.history.iter().copied().collect();
+        let parrot: Vec<TokenId> = ctx.iter().rev().copied().take(4).collect();
+        generate_one(
+            &self.store,
+            self.smoothing.as_ref(),
+            &self.params,
+            &ctx,
+            &parrot,
+            &mut self.rng,
+        )
+        .tokens
+        .len()
     }
 
     /// Rebuild tokenizer + SA from the log (source of truth).

@@ -147,8 +147,6 @@ fn entropy(hist: &FxHashMap<u32, u32>) -> f64 {
 pub struct Tokenized {
     pub morphemes: Vec<TokenId>,
     pub chunks: Vec<TokenId>,
-    pub morph_strs: Vec<String>,
-    pub chunk_strs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,52 +170,39 @@ impl Tokenizer {
     }
 
     pub fn tokenize(&self, intern: &mut Interner, text: &str) -> Tokenized {
-        let morphs = self.morphemes(text);
-        let chunks = chunk(&morphs, self.chunk_morphs);
-        let mut morphemes = Vec::with_capacity(morphs.len());
-        let mut morph_strs = Vec::with_capacity(morphs.len());
-        for m in &morphs {
-            morph_strs.push(m.clone());
-            morphemes.push(intern.intern(m));
+        let spans = self.morph_spans(text);
+        let mut morphemes = Vec::with_capacity(spans.len());
+        for &(lo, hi) in &spans {
+            morphemes.push(intern.intern(&text[lo..hi]));
         }
-        let mut chunk_ids = Vec::with_capacity(chunks.len());
-        let mut chunk_strs = Vec::with_capacity(chunks.len());
-        for c in &chunks {
-            chunk_strs.push(c.clone());
-            chunk_ids.push(intern.intern(c));
-        }
-        Tokenized {
-            morphemes,
-            chunks: chunk_ids,
-            morph_strs,
-            chunk_strs,
-        }
+        let chunks = chunk_intern(intern, &morphemes, self.chunk_morphs);
+        Tokenized { morphemes, chunks }
     }
 
-    fn morphemes(&self, text: &str) -> Vec<String> {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.is_empty() {
+    fn morph_spans(&self, text: &str) -> Vec<(usize, usize)> {
+        let char_idx: Vec<(usize, char)> = text.char_indices().collect();
+        if char_idx.is_empty() {
             return Vec::new();
         }
-        let mut cuts = vec![false; chars.len() + 1];
+        let n = char_idx.len();
+        let mut cuts = vec![false; n + 1];
         cuts[0] = true;
-        cuts[chars.len()] = true;
-
-        for i in 1..chars.len() {
-            if class(chars[i - 1]) != class(chars[i]) {
+        cuts[n] = true;
+        for i in 1..n {
+            if class(char_idx[i - 1].1) != class(char_idx[i].1) {
                 cuts[i] = true;
             }
         }
-
         if self.model.ready() {
-            let codes: Vec<u32> = chars.iter().map(|c| *c as u32).collect();
-            let mut scores = vec![0.0; chars.len()];
-            for i in 0..chars.len().saturating_sub(1) {
-                if class(chars[i]) == class(chars[i + 1]) && is_cjk(class(chars[i])) {
+            let codes: Vec<u32> = char_idx.iter().map(|(_, c)| *c as u32).collect();
+            let mut scores = vec![0.0; n];
+            for i in 0..n.saturating_sub(1) {
+                if class(char_idx[i].1) == class(char_idx[i + 1].1) && is_cjk(class(char_idx[i].1))
+                {
                     scores[i] = self.model.cut_score(&codes, i);
                 }
             }
-            for i in 0..chars.len().saturating_sub(1) {
+            for i in 0..n.saturating_sub(1) {
                 if scores[i] < self.cut {
                     continue;
                 }
@@ -228,23 +213,31 @@ impl Tokenizer {
                 }
             }
         } else {
-            // Weak model: split CJK to characters so Markov has something to chew.
-            for (i, &c) in chars.iter().enumerate() {
+            for (i, &(_, c)) in char_idx.iter().enumerate() {
                 if is_cjk(class(c)) {
                     cuts[i] = true;
                     cuts[i + 1] = true;
                 }
             }
         }
-
+        let byte_at = |i: usize| -> usize {
+            if i < n {
+                char_idx[i].0
+            } else {
+                text.len()
+            }
+        };
         let mut out = Vec::new();
         let mut start = 0;
-        for i in 1..=chars.len() {
+        #[allow(clippy::needless_range_loop)]
+        for i in 1..=n {
             if cuts[i] {
                 if i > start {
-                    let s: String = chars[start..i].iter().collect();
+                    let lo = byte_at(start);
+                    let hi = byte_at(i);
+                    let s = &text[lo..hi];
                     if !s.chars().all(|c| class(c) == Class::Ws) {
-                        out.push(s);
+                        out.push((lo, hi));
                     }
                 }
                 start = i;
@@ -252,38 +245,48 @@ impl Tokenizer {
         }
         out
     }
+
+    #[cfg(test)]
+    fn morphemes(&self, text: &str) -> Vec<String> {
+        self.morph_spans(text)
+            .into_iter()
+            .map(|(lo, hi)| text[lo..hi].to_string())
+            .collect()
+    }
 }
 
 fn is_cjk(c: Class) -> bool {
     matches!(c, Class::Han | Class::Hira | Class::Kata)
 }
 
-fn chunk(morphs: &[String], k: usize) -> Vec<String> {
+fn chunk_intern(intern: &mut Interner, morphs: &[TokenId], k: usize) -> Vec<TokenId> {
     if morphs.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut buf = String::new();
     let mut n = 0;
-    for m in morphs {
-        let punct = m.chars().all(|c| class(c) == Class::Punct);
+    for &id in morphs {
+        let punct = intern.get(id).chars().all(|c| class(c) == Class::Punct);
         if punct {
             if !buf.is_empty() {
-                out.push(std::mem::take(&mut buf));
+                out.push(intern.intern(&buf));
+                buf.clear();
                 n = 0;
             }
-            out.push(m.clone());
+            out.push(id);
             continue;
         }
-        buf.push_str(m);
+        buf.push_str(intern.get(id));
         n += 1;
         if n >= k {
-            out.push(std::mem::take(&mut buf));
+            out.push(intern.intern(&buf));
+            buf.clear();
             n = 0;
         }
     }
     if !buf.is_empty() {
-        out.push(buf);
+        out.push(intern.intern(&buf));
     }
     out
 }
@@ -317,8 +320,9 @@ mod tests {
         let tok = Tokenizer::new(&Params::default());
         let mut intern = Interner::new();
         let t = tok.tokenize(&mut intern, "hello世界123");
-        assert!(t.morph_strs.iter().any(|s| s == "hello"));
-        assert!(t.morph_strs.iter().any(|s| s.contains('世') || *s == "世"));
+        let morphs: Vec<&str> = t.morphemes.iter().map(|id| intern.get(*id)).collect();
+        assert!(morphs.iter().any(|s| *s == "hello"));
+        assert!(morphs.iter().any(|s| s.contains('世') || *s == "世"));
     }
 
     #[test]
