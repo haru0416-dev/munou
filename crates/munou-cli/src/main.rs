@@ -69,7 +69,7 @@ enum Command {
         /// Trigger dictionary. Defaults to `data/triggers.example.json` if present.
         #[arg(long)]
         triggers: Option<PathBuf>,
-        /// RNG seed. Same log + same seed → identical replies.
+        /// RNG seed. Same log + same seed → identical probe replies.
         #[arg(long, default_value_t = 1)]
         rng_seed: u64,
         /// Slip injection probability (0 keeps the table readable).
@@ -242,7 +242,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             "/quit" | "/exit" => break,
             "/why" => {
                 if let Some(tr) = e.last_trace() {
-                    print!("{}", tr.trace.explain_text());
+                    print!("{}", tr.explain_text());
                 } else {
                     writeln!(stdout, "(no trace yet)")?;
                 }
