@@ -26,14 +26,14 @@ fn trigger_wins_greeting_against_echo() {
     let trig = dir.join("t.json");
     fs::write(
         &trig,
-        r#"[{"pattern":"\u304a\u306f\u3088\u3046","responses":["\u304a\u306f\u3088\u30fb\u30c6\u30b9\u30c8\u5fdc\u7b54"]}]"#,
+        r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
     )
     .unwrap();
     let mut e = Engine::ephemeral(Params::default(), 3).unwrap();
     e.load_triggers(&trig).unwrap();
-    let r = e.respond("\u304a\u306f\u3088\u3046").unwrap();
+    let r = e.respond("おはよう").unwrap();
     assert_eq!(r.trace.path, PathKind::Trigger);
-    assert_eq!(r.text, "\u304a\u306f\u3088\u30fb\u30c6\u30b9\u30c8\u5fdc\u7b54");
+    assert_eq!(r.text, "おはよ・テスト応答");
     assert!(r.trace.trigger.is_some());
     assert!(
         r.trace
@@ -51,7 +51,7 @@ fn exclusive_trigger_skips_echo_and_markov() {
     let trig = dir.join("t.json");
     fs::write(
         &trig,
-        r#"[{"pattern":"\u304a\u306f\u3088\u3046","responses":["\u304a\u306f\u3088\u30fb\u30c6\u30b9\u30c8\u5fdc\u7b54"]}]"#,
+        r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
     )
     .unwrap();
     let params = Params {
@@ -60,7 +60,7 @@ fn exclusive_trigger_skips_echo_and_markov() {
     };
     let mut e = Engine::ephemeral(params, 3).unwrap();
     e.load_triggers(&trig).unwrap();
-    let r = e.respond("\u304a\u306f\u3088\u3046").unwrap();
+    let r = e.respond("おはよう").unwrap();
     assert_eq!(r.trace.path, PathKind::Trigger);
     assert!(
         !r.trace
@@ -80,9 +80,9 @@ fn empty_pool_engine_labels_echo_not_markov() {
         ..Params::default()
     };
     let mut e = Engine::ephemeral(params, 1).unwrap();
-    let r = e.respond("\u3042\u308a\u304c\u3068\u3046").unwrap();
+    let r = e.respond("ありがとう").unwrap();
     assert_eq!(r.trace.path, PathKind::Echo);
-    assert_eq!(r.text, "\u3042\u308a\u304c\u3068\u3046");
+    assert_eq!(r.text, "ありがとう");
     assert!(
         !r.trace
             .candidates
@@ -100,7 +100,7 @@ fn zero_slip_never_selects_below_rank_one() {
         ..Params::default()
     };
     let mut e = Engine::ephemeral(params, 11).unwrap();
-    for line in ["\u3053\u3093\u306b\u3061\u306f", "\u4eca\u65e5\u306f\u6674\u308c", "\u6563\u6b69\u3057\u3088\u3046", "\u306d"] {
+    for line in ["こんにちは", "今日は晴れ", "散歩しよう", "ね"] {
         let r = e.respond(line).unwrap();
         assert!(!r.trace.slipped, "slipped with p_slip=0");
         assert_eq!(r.trace.chosen_rank, 0);
@@ -117,9 +117,9 @@ fn full_slip_picks_non_top_when_multiple_candidates() {
     let mut e = Engine::ephemeral(params, 11).unwrap();
     let mut slipped = false;
     for line in [
-        "\u3053\u3093\u306b\u3061\u306f\u4e16\u754c",
-        "\u4eca\u65e5\u306f\u3068\u3066\u3082\u826f\u3044\u5929\u6c17\u3067\u3059\u306d",
-        "\u307e\u305f\u660e\u65e5\u4f1a\u3044\u307e\u3057\u3087\u3046",
+        "こんにちは世界",
+        "今日はとても良い天気ですね",
+        "また明日会いましょう",
     ] {
         let r = e.respond(line).unwrap();
         if r.trace.candidates.len() >= 2 && r.trace.slipped {
@@ -127,14 +127,14 @@ fn full_slip_picks_non_top_when_multiple_candidates() {
             assert!(r.trace.chosen_rank >= 1);
         }
     }
-    assert!(slipped, "p_slip=1 should slip when \u22652 candidates exist");
+    assert!(slipped, "p_slip=1 should slip when ≥2 candidates exist");
 }
 
 #[test]
 fn explain_chain_is_complete() {
     let mut e = Engine::ephemeral(Params::default(), 4).unwrap();
-    let r = e.respond("\u8aac\u660e\u53ef\u80fd\u6027\u306e\u30c6\u30b9\u30c8").unwrap();
-    assert_eq!(r.trace.input, "\u8aac\u660e\u53ef\u80fd\u6027\u306e\u30c6\u30b9\u30c8");
+    let r = e.respond("説明可能性のテスト").unwrap();
+    assert_eq!(r.trace.input, "説明可能性のテスト");
     assert!(!r.trace.morphemes.is_empty());
     assert!(!r.trace.chunks.is_empty());
     assert!(!r.trace.candidates.is_empty());
@@ -154,12 +154,12 @@ fn jsonl_log_is_source_of_truth() {
             triggers_path: None,
         })
         .unwrap();
-        e.respond("\u7b2c\u4e00\u58f0").unwrap();
-        e.respond("\u7b2c\u4e8c\u58f0").unwrap();
+        e.respond("第一声").unwrap();
+        e.respond("第二声").unwrap();
     }
     let raw = fs::read_to_string(&log).unwrap();
     let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(lines.len(), 4, "user+bot \u00d7 2 turns");
+    assert_eq!(lines.len(), 4, "user+bot × 2 turns");
     for line in &lines {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["v"], 1);
@@ -183,7 +183,7 @@ fn kn_smoothing_responds() {
         ..Params::default()
     };
     let mut e = Engine::ephemeral(params, 8).unwrap();
-    let r = e.respond("\u30ca\u30a4\u30fc\u30d6\u3067\u306f\u306a\u3044\u5e73\u6ed1\u5316").unwrap();
+    let r = e.respond("ナイーブではない平滑化").unwrap();
     assert!(!r.text.is_empty());
 }
 
@@ -198,7 +198,7 @@ fn trigger_dict_parses_example() {
 #[test]
 fn user_chunks_enter_generation_context() {
     let mut e = Engine::ephemeral(Params::default(), 2).unwrap();
-    let r = e.respond("\u3053\u308c\u306f\u6587\u8108\u306b\u5165\u308b\u306f\u305a").unwrap();
+    let r = e.respond("これは文脈に入るはず").unwrap();
     if r.trace.path == PathKind::Markov && !r.trace.steps.is_empty() {
         assert!(
             r.trace.steps[0].ctx_len_requested >= r.trace.chunks.len(),
@@ -253,7 +253,7 @@ fn append_survives_partial_process_exit() {
         triggers_path: None,
     })
     .unwrap();
-    e.respond("\u843d\u3061\u3066\u3082\u6b8b\u308b").unwrap();
+    e.respond("落ちても残る").unwrap();
     drop(e);
     // Simulate a new process: the JSONL must already be complete on disk.
     let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -307,7 +307,7 @@ fn seed_log_grows_corpus_and_diverts_empty() {
         grown_st.vocab
     );
 
-    let prompts = ["\u6563\u6b69\u3057\u306a\u3044\uff1f", "\u30b3\u30fc\u30d2\u30fc\u98f2\u3080\uff1f", "\u732b\u307f\u3066", "\u30b2\u30fc\u30e0\u3057\u306a\u3044\uff1f"];
+    let prompts = ["散歩しない？", "コーヒー飲む？", "猫みて", "ゲームしない？"];
     let mut differ = 0;
     for p in prompts {
         if empty.respond(p).unwrap().text != grown.respond(p).unwrap().text {
@@ -319,9 +319,9 @@ fn seed_log_grows_corpus_and_diverts_empty() {
         "seeded engine should not parrot like empty; differ={differ}"
     );
 
-    let hi = grown.respond("\u304a\u306f\u3088\u3046").unwrap();
+    let hi = grown.respond("おはよう").unwrap();
     assert_eq!(hi.trace.path, PathKind::Trigger);
-    let walk = grown.respond("\u6563\u6b69\u3057\u306a\u3044\uff1f").unwrap();
+    let walk = grown.respond("散歩しない？").unwrap();
     let nsrc = walk
         .trace
         .candidates
@@ -335,7 +335,7 @@ fn seed_log_grows_corpus_and_diverts_empty() {
         walk.trace.path,
         walk.trace.candidates.len()
     );
-    let ood = grown.respond("\u91cf\u5b50\u529b\u5b66\u306e\u8a71\u3092\u3057\u3088\u3046").unwrap();
+    let ood = grown.respond("量子力学の話をしよう").unwrap();
     assert_ne!(
         ood.trace.path,
         PathKind::Trigger,
