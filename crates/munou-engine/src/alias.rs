@@ -103,6 +103,56 @@ impl AliasTable {
     }
 }
 
+/// Nucleus (top-p) then optional top-k. Always keeps ≥1 mass-bearing entry.
+/// `p >= 1` and `k == 0` is a no-op. This is the closed analog of LLM decode
+/// filters — the distribution still comes from the suffix array.
+pub fn nucleus(ids: &mut Vec<crate::ids::TokenId>, weights: &mut Vec<f64>, p: f64, k: usize) {
+    let n = weights.len().min(ids.len());
+    if n == 0 {
+        return;
+    }
+    let p = p.clamp(0.0, 1.0);
+    if p >= 1.0 - 1e-12 && k == 0 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        weights[b]
+            .partial_cmp(&weights[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if k > 0 && k < order.len() {
+        order.truncate(k);
+    }
+    let tot: f64 = order.iter().map(|&i| weights[i].max(0.0)).sum();
+    if tot <= 0.0 {
+        return;
+    }
+    let thresh = p * tot;
+    let mut acc = 0.0;
+    let mut keep = vec![false; n];
+    for i in order {
+        keep[i] = true;
+        acc += weights[i].max(0.0);
+        if acc + 1e-12 >= thresh {
+            break;
+        }
+    }
+    let mut ni = Vec::new();
+    let mut nw = Vec::new();
+    for i in 0..n {
+        if keep[i] {
+            ni.push(ids[i]);
+            nw.push(weights[i]);
+        }
+    }
+    if ni.is_empty() {
+        return;
+    }
+    *ids = ni;
+    *weights = nw;
+}
+
 /// Apply temperature `τ`: `p_i^{1/τ}` then renormalise. `τ == 1` is identity.
 pub fn temper(weights: &mut [f64], tau: f64) {
     if (tau - 1.0).abs() < 1e-12 {
@@ -153,5 +203,15 @@ mod tests {
         assert!(w[1] > w[0] && w[1] > w[2]);
         let z: f64 = w.iter().sum();
         assert!(z > 0.0);
+    }
+
+    #[test]
+    fn nucleus_keeps_head_mass() {
+        let mut ids = vec![1u32, 2, 3, 4];
+        let mut w = vec![0.7, 0.2, 0.05, 0.05];
+        nucleus(&mut ids, &mut w, 0.9, 0);
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert_eq!(ids.len(), 2);
     }
 }

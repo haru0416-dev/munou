@@ -29,6 +29,9 @@ pub struct GenStep {
     pub freq: u32,
     pub sampled: TokenId,
     pub temperature: f32,
+    /// Sampling probability after temperature + nucleus (decode analog of logprobs).
+    pub p: f32,
+    pub logp: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +76,12 @@ pub struct Trace {
     pub novelty_lcs: usize,
     pub similarity: f32,
     pub band_hit: bool,
+    /// Closed analog of a tool/MoE trace. None on old in-memory tests that skip routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// RLHF-lite path prior from `/good` `/bad`.
+    #[serde(default)]
+    pub path_prior: [f32; 4],
 }
 
 impl Trace {
@@ -93,6 +102,17 @@ impl Trace {
             "learned={} (p_learn={:.2} roll={:.3})\n",
             self.learned, self.p_learn, self.learn_roll
         ));
+        if let Some(r) = &self.route {
+            s.push_str(r);
+            s.push('\n');
+        }
+        let pr = self.path_prior;
+        if pr.iter().any(|x| *x != 0.0) {
+            s.push_str(&format!(
+                "pref trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2}\n",
+                pr[0], pr[1], pr[2], pr[3]
+            ));
+        }
         s.push_str(&format!(
             "morph=[{}]  chunk=[{}]\n",
             self.morphemes.join(" / "),
@@ -123,8 +143,8 @@ impl Trace {
             s.push_str("gen:");
             for st in &self.steps {
                 s.push_str(&format!(
-                    "  ctx {}→{} f={} tok={}",
-                    st.ctx_len_requested, st.ctx_len_used, st.freq, st.sampled
+                    "  ctx {}\u2192{} f={} tok={} p={:.3}",
+                    st.ctx_len_requested, st.ctx_len_used, st.freq, st.sampled, st.p
                 ));
             }
             s.push('\n');

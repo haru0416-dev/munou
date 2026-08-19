@@ -2,12 +2,15 @@
 
 use rand::Rng;
 
-use crate::alias::{temper, AliasTable};
+use crate::alias::{nucleus, temper, AliasTable};
 use crate::explain::GenStep;
 use crate::ids::{TokenId, EOS};
 use crate::params::Params;
 use crate::smoothing::Smoothing;
 use crate::store::Store;
+use rustc_hash::FxHashMap;
+
+type NextMemo = FxHashMap<Vec<TokenId>, (Vec<(TokenId, u32)>, u32)>;
 
 #[derive(Debug, Clone)]
 pub struct Generated {
@@ -26,6 +29,7 @@ pub fn generate_one<R: Rng + ?Sized>(
     let mut tokens: Vec<TokenId> = Vec::new();
     let mut steps: Vec<GenStep> = Vec::new();
     let l_max = params.l_max_capped();
+    let mut memo: NextMemo = FxHashMap::default();
 
     let cap = if store.is_empty() {
         parrot.len().clamp(1, 8)
@@ -43,18 +47,25 @@ pub fn generate_one<R: Rng + ?Sized>(
         }
 
         let requested = ctx.len();
-        let (ids, weights, used_len, freq) =
-            dist_with_backoff(store, smoothing, params, &ctx, parrot);
+        let (mut ids, mut weights, used_len, freq) =
+            dist_with_backoff(store, smoothing, params, &ctx, parrot, &mut memo);
 
         if ids.is_empty() {
             break;
         }
 
-        let mut w = weights;
-        temper(&mut w, params.tau_gen);
-        let table = AliasTable::from_weights(&w);
+        temper(&mut weights, params.tau_gen);
+        nucleus(&mut ids, &mut weights, params.p_nucleus, params.k_top);
+        let z: f64 = weights.iter().copied().filter(|x| *x > 0.0).sum();
+        let table = AliasTable::from_weights(&weights);
         let idx = table.sample(rng);
         let sampled = ids[idx];
+        let p = if z > 0.0 {
+            (weights[idx].max(0.0) / z) as f32
+        } else {
+            0.0
+        };
+        let logp = if p > 0.0 { p.ln() } else { f32::NEG_INFINITY };
 
         steps.push(GenStep {
             ctx_len_requested: requested,
@@ -62,6 +73,8 @@ pub fn generate_one<R: Rng + ?Sized>(
             freq,
             sampled,
             temperature: params.tau_gen as f32,
+            p,
+            logp,
         });
 
         if sampled == EOS {
@@ -79,6 +92,8 @@ pub fn generate_one<R: Rng + ?Sized>(
                 freq: 0,
                 sampled: t,
                 temperature: params.tau_gen as f32,
+                p: 1.0,
+                logp: 0.0,
             });
         }
     }
@@ -92,6 +107,7 @@ fn dist_with_backoff(
     params: &Params,
     ctx: &[TokenId],
     parrot: &[TokenId],
+    memo: &mut NextMemo,
 ) -> (Vec<TokenId>, Vec<f64>, usize, u32) {
     let unigram = if matches!(params.smoothing, crate::params::SmoothingKind::Kn) {
         store.continuation_unigram()
@@ -111,7 +127,14 @@ fn dist_with_backoff(
     let mut freq = 0u32;
     for len in 1..=ctx.len() {
         let sub = &ctx[ctx.len() - len..];
-        let (counts, total) = store.next_counts(sub);
+        let key = sub.to_vec();
+        let (counts, total) = if let Some(hit) = memo.get(&key) {
+            hit.clone()
+        } else {
+            let got = store.next_counts(sub);
+            memo.insert(key, got.clone());
+            got
+        };
         if total == 0 {
             continue;
         }
@@ -255,6 +278,7 @@ mod tests {
         assert!(!g.steps.is_empty());
         assert!(g.steps[0].ctx_len_used >= 2);
         assert!(g.steps[0].freq >= 3);
+        assert!(g.steps[0].p > 0.0 && g.steps[0].p <= 1.0);
     }
 
     #[test]
