@@ -215,3 +215,57 @@ fn append_survives_partial_process_exit() {
     assert!(e2.stats().utterances >= 2);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn seed_log_grows_corpus_and_diverts_empty() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let seed = root.join("data/seed.jsonl");
+    let trig = root.join("data/triggers.example.json");
+    assert!(seed.exists(), "missing {}", seed.display());
+    let dir = tmp_dir("seed");
+    fs::copy(&seed, dir.join("log.jsonl")).unwrap();
+
+    let params = Params {
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let empty_st = Engine::ephemeral(params.clone(), 1).unwrap().stats();
+    let mut empty = Engine::ephemeral(params.clone(), 1).unwrap();
+    let mut grown = Engine::open(OpenConfig {
+        params,
+        seed: 1,
+        log_path: Some(dir.join("log.jsonl")),
+        triggers_path: Some(trig),
+    })
+    .unwrap();
+    let grown_st = grown.stats();
+    assert_eq!(grown_st.utterances, 50);
+    assert!(
+        grown_st.tokens > empty_st.tokens && grown_st.tokens >= 40,
+        "tokens empty={} seed={}",
+        empty_st.tokens,
+        grown_st.tokens
+    );
+    assert!(
+        grown_st.vocab > empty_st.vocab,
+        "vocab empty={} seed={}",
+        empty_st.vocab,
+        grown_st.vocab
+    );
+
+    let prompts = ["散歩しない？", "コーヒー飲む？", "猫みて", "ゲームしない？"];
+    let mut differ = 0;
+    for p in prompts {
+        if empty.respond(p).unwrap().text != grown.respond(p).unwrap().text {
+            differ += 1;
+        }
+    }
+    assert!(
+        differ >= 1,
+        "seeded engine should not parrot like empty; differ={differ}"
+    );
+
+    let hi = grown.respond("おはよう").unwrap();
+    assert_eq!(hi.trace.path, PathKind::Trigger);
+    let _ = fs::remove_dir_all(&dir);
+}

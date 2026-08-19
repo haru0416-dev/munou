@@ -31,7 +31,10 @@ cargo run -p munou-cli --release -- bench --tokens 10000000
 # SA-IS n=10000000  ~1.0s   (要件: ≤ 2s)
 
 cargo run -p munou-cli --release -- verify --sa-tokens 10000000 --turns 300
+cargo run -p munou-cli --release -- probe --seed data/seed.jsonl
 ```
+
+`probe` は `data/seed.jsonl`（25往復の雑談ログ）を読み、空エンジンと育てたエンジンで同じ入力を投げて数値を出す。
 
 設計書との突き合わせは [`docs/verify.md`](docs/verify.md)。
 
