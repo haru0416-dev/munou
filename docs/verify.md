@@ -22,16 +22,16 @@ v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS（unit 24 + spec 13） |
+| `cargo test --workspace` | PASS（unit 24 + spec 16） |
 
-spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開を固定する。
+spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップを固定する。
 
 ## 四性質
 
 | 性質 | 判定 | 根拠 |
 |---|---|---|
 | 説明可能 | PASS | `/why` と `say --explain` が path・形態素・チャンク・候補スコア・ズレ roll・生成ステップを出す。spec `explain_chain_is_complete` |
-| 育てられる | PASS | `log.jsonl` が追記され再オープンで復元。`data/seed.jsonl` 25往復で tokens 0→176 / vocab 0→99。同じ8入力で空と 7/8 が食い違う（`munou probe`）。候補はトリガー/検索/マルコフ/エコーのプール |
+| 育てられる | PASS | `log.jsonl` が追記され再オープンで復元。ライブでは `p_learn` でコーパスへ吸収（既定 0.35）。シードログは `learned` 省略＝吸収済み。`data/seed.jsonl` 25往復で tokens 0→176 / vocab 0→99。同じ8入力で空と 7/8 が食い違う（`munou probe`）。候補はトリガー/検索/マルコフ/エコーのプール |
 | 閉じている | PASS | `Cargo.lock` に reqwest / candle / tokenizers / llama 等なし。生成はマルコフのみ。embedding は選択用ハッシュ。学習コーパスは自分のログ。トリガー辞書はユーザー供給（形態素辞書と同じ例外枠） |
 | ズレる | PASS | `p_slip=0` で slip なし、`p_slip=1` かつ候補≥2 で 2 位以下を採用 |
 
@@ -41,7 +41,7 @@ spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL が�
 
 1. `おはよう` → path=Trigger、辞書応答 `おはよう`、sim=1.000
 2. `今日はいい天気だね` → path=Markov。コーパスが挨拶中心なので候補も挨拶に寄る（閉じていることの実演）
-3. `log.jsonl` に user/bot が 2 ターン分追記され、`score` / `slipped` が残る
+3. `log.jsonl` に user/bot が 2 ターン分追記され、`score` / `slipped` / `learned` が残る
 4. 別ディレクトリ・同一シードで `散歩しようか` の応答が一致
 
 ## 非機能要件 §2.2
@@ -82,7 +82,7 @@ debug ビルドのトークナイズは ~6MB/s で要件未満、engine-p99 も 
 
 ## パラメータ初期値
 
-実装の `Params::default` は設計 §5 の目安と一致: N_cand=10, τ=1.0, L_max=8, f_min=3, k_topic=5, p_slip=0.15。θ_trig は 0.42 で「意図的に緩く」。
+実装の `Params::default` は設計 §5 の目安と一致: N_cand=10, τ=1.0, L_max=8, f_min=3, k_topic=5, p_slip=0.15, p_learn=0.35。θ_trig は 0.42 で「意図的に緩く」。
 
 ## 評価 §6
 
@@ -92,7 +92,7 @@ debug ビルドのトークナイズは ~6MB/s で要件未満、engine-p99 も 
 
 `data/seed.jsonl` は散歩・コーヒー・猫・仕事・ゲームを繰り返した 25往復（50レコード）。学習はこれだけ。外部コーパスは使わない。v0.1.1 から既定は候補プール（`--mix pool`）。
 
-再現: `cargo run -p munou-cli --release -- probe --seed data/seed.jsonl`（rng=1, p_slip=0, `data/triggers.example.json`）
+再現: `cargo run -p munou-cli --release -- probe --seed data/seed.jsonl`（rng=1, p_slip=0, p_learn=1, `data/triggers.example.json`）
 
 | 項目 | 空エンジン | シード後 | 読み |
 |---|---|---|---|
@@ -103,14 +103,14 @@ debug ビルドのトークナイズは ~6MB/s で要件未満、engine-p99 も 
 | trigger 率 | 2/8 | 2/8 | `おはよう` / `ありがとう` は辞書が勝つ |
 | 勝ち筋 | Echo/Mark 混在 | Trigger / Retrieve / Markov | 同じ入力でもソースが分かれる |
 | mean ctx_len_used | 0.38 | 0.50 | 最長一致がわずかに伸びる |
-| mean_sim | 0.474 | 0.381 | 帯域 `[0.25,0.85]` の内側寄り |
+| mean_sim | 0.508 | 0.418 | 帯域 `[0.25,0.85]` の内側寄り |
 | band_hit | — | 88% | 8本中7本 |
-| rote_lcs | — | 0.75 | 検索が勝つと既存発話に寄る |
+| rote_lcs | — | 0.50 | 検索が勝つと既存発話に寄る |
 | slip | — | 0% | p_slip=0 |
-| 応答 mean / max | — | 174µs / 248µs | release、embed 込み |
+| 応答 mean / max | — | 153µs / 223µs | release、embed 込み |
 | hybrid-pool | — | 最大3ソース | ドメイン内プロンプトの候補リスト |
 
-ドメイン外の `量子力学の話をしよう` は Trigger に落ちず Markov `うちの猫かわいい散歩しない？？`。知っていることはログ由来。空側のマルコフはユーザー文の破片、シード側はログ n-gram の組み換えか検索。
+ドメイン外の `量子力学の話をしよう` は Trigger に落ちず Markov `コーヒー飲もう猫かわいい`。知っていることはログ由来。空側のマルコフはユーザー文の破片、シード側はログ n-gram の組み換えか検索。ライブでは `p_learn`（probe は 1）でコーパスへ吸収し、会話ログは毎回残す。
 
 `munou probe` は tokens/vocab 増加、≥3本の食い違い、おはよう=Trigger、OOD≠Trigger、プールに複数ソース、決定性、p_slip=0 で slip なしを PASS/FAIL する。CI もこれを回す。
 
