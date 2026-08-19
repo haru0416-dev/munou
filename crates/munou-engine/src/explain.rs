@@ -76,6 +76,13 @@ pub struct Trace {
 }
 
 impl Trace {
+    pub fn explain_compact(&self) -> String {
+        format!(
+            "path={:?} learned={} sim={:.3} slipped={}",
+            self.path, self.learned, self.similarity, self.slipped
+        )
+    }
+
     pub fn explain_text(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!(
@@ -116,7 +123,7 @@ impl Trace {
             s.push_str("gen:");
             for st in &self.steps {
                 s.push_str(&format!(
-                    "  ctx {}→{} f={} tok={}",
+                    "  ctx {}	o{} f={} tok={}",
                     st.ctx_len_requested, st.ctx_len_used, st.freq, st.sampled
                 ));
             }

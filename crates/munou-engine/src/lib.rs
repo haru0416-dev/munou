@@ -26,3 +26,18 @@ mod tokenizer;
 mod trigger;
 
 pub use engine::{Engine, OpenConfig, Reply, Stats};
+pub use error::{Error, Result};
+pub use eval::EvalAccum;
+pub use explain::{CandidateTrace, GenStep, PathKind, Trace, TriggerTrace};
+pub use ids::{is_special, special_name, TokenId, BOS, EOS, FIRST_USER, SEP};
+pub use intern::Interner;
+pub use log::{AppendLog, Record, Role};
+pub use observe::{Observe, Stage};
+pub use params::{MixMode, Params, SmoothingKind};
+pub use sais::{sa_range, suffix_array};
+pub use tokenizer::{detokenize, Tokenizer};
+pub use trigger::TriggerDict;
+
+pub use embed::{cosine, Embedder, HashEmbedder, TopicTracker};
+pub use smoothing::{KneserNey, NaiveBackoff, Smoothing};
+pub use store::Store;
