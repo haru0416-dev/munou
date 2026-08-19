@@ -143,7 +143,7 @@ impl Trace {
             s.push_str("gen:");
             for st in &self.steps {
                 s.push_str(&format!(
-                    "  ctx {}\u2192{} f={} tok={} p={:.3}",
+                    "  ctx {}→{} f={} tok={} p={:.3}",
                     st.ctx_len_requested, st.ctx_len_used, st.freq, st.sampled, st.p
                 ));
             }
