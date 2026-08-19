@@ -15,6 +15,7 @@ use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
 use crate::log::{now_ms, AppendLog, Record, Role};
 use crate::mix::Pool;
+use crate::observe::Observe;
 use crate::params::{MixMode, Params};
 use crate::select::{rank_and_pick, RankInput};
 use crate::smoothing::{self, Smoothing};
@@ -123,6 +124,11 @@ impl Engine {
         store.merge();
         trim_history(&mut history, cfg.params.l_max_capped() * 4);
 
+        let mut eval = EvalAccum::default();
+        for rec in &log.records {
+            eval.ingest_bot(rec, &cfg.params);
+        }
+
         let smoothing = smoothing::boxed(cfg.params.smoothing, cfg.params.kn_discount);
         Ok(Self {
             intern,
@@ -137,7 +143,7 @@ impl Engine {
             log,
             last_trace: None,
             smoothing,
-            eval: EvalAccum::default(),
+            eval,
             history,
             prior,
             bots,
@@ -279,14 +285,30 @@ impl Engine {
         };
 
         self.eval.observe(&trace, chosen_tokens.len());
-        self.commit(Role::User, input, None, None, learned)?;
-        self.commit(
-            Role::Bot,
-            &chosen_text,
-            Some(ranked.slipped),
-            Some(sim),
+        self.log.append(Record {
+            v: 1,
+            t: now_ms(),
+            role: Role::User,
+            text: input.to_string(),
+            slipped: None,
+            score: None,
             learned,
-        )?;
+            path: None,
+            novelty_lcs: None,
+            n_tok: None,
+        })?;
+        self.log.append(Record {
+            v: 1,
+            t: now_ms(),
+            role: Role::Bot,
+            text: chosen_text.clone(),
+            slipped: Some(ranked.slipped),
+            score: Some(sim),
+            learned,
+            path: Some(path),
+            novelty_lcs: Some(novelty_lcs),
+            n_tok: Some(chosen_tokens.len()),
+        })?;
         if learned {
             self.absorb(Role::User, input, &tok.chunks);
             self.absorb(Role::Bot, &chosen_text, &chosen_tokens);
@@ -419,25 +441,6 @@ impl Engine {
         }
     }
 
-    fn commit(
-        &mut self,
-        role: Role,
-        text: &str,
-        slipped: Option<bool>,
-        score: Option<f32>,
-        learned: bool,
-    ) -> Result<()> {
-        self.log.append(Record {
-            v: 1,
-            t: now_ms(),
-            role,
-            text: text.to_string(),
-            slipped,
-            score,
-            learned,
-        })
-    }
-
     pub fn rebuild(&mut self) -> Result<()> {
         self.store.merge();
         Ok(())
@@ -460,6 +463,16 @@ impl Engine {
 
     pub fn eval_summary(&self) -> String {
         self.eval.summary(&self.params)
+    }
+
+    pub fn observe(&self) -> Observe {
+        Observe::from_parts(
+            &self.stats(),
+            &self.params,
+            &self.log.records,
+            self.last_trace.as_ref(),
+            &self.eval,
+        )
     }
 
     pub fn params(&self) -> &Params {
