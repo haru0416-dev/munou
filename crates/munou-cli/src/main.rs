@@ -302,13 +302,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
         match t {
             "/quit" | "/exit" => break,
             "/observe" => print!("{}", e.observe().panel()),
-            "/why" => {
-                if let Some(tr) = e.last_trace() {
-                    print!("{}", tr.explain_text());
-                } else {
-                    writeln!(stdout, "(no trace yet)")?;
-                }
-            }
+            "/why" => print!("{}", e.why_text()),
             "/good" => writeln!(stdout, "{}", e.feedback(true)?)?,
             "/bad" => writeln!(stdout, "{}", e.feedback(false)?)?,
             "/stats" => {

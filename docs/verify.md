@@ -22,9 +22,9 @@ v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS（unit 37 + spec 22） |
+| `cargo test --workspace` | PASS（unit 37 + spec 22 + soak 15） |
 
-spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップ、観察窓（空 / シード育ち / 記録中 / path 再開）、meta 好みがコーパスに入らないこと、経路ゲート後もエコーがプールに残ることを固定する。
+spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップ、観察窓（空 / シード育ち / 記録中 / path 再開）、meta 好みがコーパスに入らないこと、経路ゲート後もエコーがプールに残ることを固定する。soak は変な入力・壊れた JSONL・パラメータ端・再開後の `/good` `/why`・80ターンのレイテンシを回す。
 
 ## 四性質
 
