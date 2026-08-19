@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use munou_engine::{Engine, MixMode, OpenConfig, Params, SmoothingKind};
 
 mod probe;
+mod scale;
 mod verify;
 
 #[derive(Parser, Debug)]
@@ -90,6 +91,36 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         p_learn: f64,
     },
+    /// Write a large closed conversation log (seed themes, not an external corpus).
+    Fabricate {
+        /// User/bot pairs. Utterances = 2 × pairs.
+        #[arg(long, default_value_t = 10_000)]
+        pairs: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// 0 recycles the seed register (huge count, small vocab). >0 appends turn ids.
+        #[arg(long, default_value_t = 0.0)]
+        unique_frac: f64,
+        /// Output JSONL path.
+        #[arg(long, default_value = "munou-data/grown.jsonl")]
+        out: PathBuf,
+    },
+    /// Fabricate a huge log, time `Engine::open`, then respond to a fixed prompt set.
+    Scale {
+        #[arg(long, default_value_t = 10_000)]
+        pairs: usize,
+        #[arg(long, default_value_t = 1)]
+        rng_seed: u64,
+        #[arg(long, default_value_t = 0.0)]
+        unique_frac: f64,
+        /// Directory or `.jsonl` path. Default is a temp dir.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.0)]
+        p_slip: f64,
+        #[arg(long, default_value_t = 1.0)]
+        p_learn: f64,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -136,6 +167,9 @@ struct Common {
     /// Decode top-k after nucleus. 0 = off.
     #[arg(long, alias = "top-k")]
     k_top: Option<usize>,
+    /// Recent bot utterances scanned for retrieve. 0 = all. Default 1024.
+    #[arg(long)]
+    retrieve_scan: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -209,6 +243,38 @@ fn main() -> Result<()> {
                 p_learn,
             })
         }
+        Command::Fabricate {
+            pairs,
+            seed,
+            unique_frac,
+            out,
+        } => {
+            let n = munou_engine::fabricate_write(
+                &out,
+                munou_engine::FabricateOpts {
+                    pairs: pairs.max(1),
+                    rng_seed: seed,
+                    unique_frac,
+                },
+            )?;
+            println!("wrote {n} utterances → {}", out.display());
+            Ok(())
+        }
+        Command::Scale {
+            pairs,
+            rng_seed,
+            unique_frac,
+            out,
+            p_slip,
+            p_learn,
+        } => scale::run(scale::ScaleArgs {
+            pairs,
+            rng_seed,
+            unique_frac,
+            out,
+            p_slip,
+            p_learn,
+        }),
     }
 }
 
@@ -240,6 +306,9 @@ fn params_from(c: &Common) -> Params {
     }
     if let Some(k) = c.k_top {
         p.k_top = k;
+    }
+    if let Some(s) = c.retrieve_scan {
+        p.n_retrieve_scan = s;
     }
     if let Some(s) = &c.smoothing {
         p.smoothing = match s.to_ascii_lowercase().as_str() {
