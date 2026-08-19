@@ -39,10 +39,16 @@ pub struct Params {
     pub band_penalty: f32,
     /// Boltzmann temperature for p_slip sampling of ranks ≥ 2.
     pub tau_slip: f64,
-    /// Smoothing: `"naive"` or `"kn"`.
+    /// Smoothing: `"naive"` (Witten-Bell) or `"kn"` (modified Kneser-Ney).
     pub smoothing: SmoothingKind,
-    /// Absolute discount for Kneser-Ney.
+    /// Fallback absolute discount when bigram n1/n2 are too small. 0 disables MKN discounts.
     pub kn_discount: f64,
+    /// Mix weight for a gapped (skip-gram) context. Applied only when the contiguous match is sparse.
+    pub lambda_skip: f64,
+    /// Mix weight for a recency unigram cache (Kuhn & De Mori analog). Sparse contexts only.
+    pub lambda_cache: f64,
+    /// PPM-C exclusion on Witten-Bell interpolation. Modified KN already excludes.
+    pub ppm_exclude: bool,
     /// How candidate sources are combined.
     pub mix: MixMode,
     /// Max retrieved past bot utterances in the pool.
@@ -114,6 +120,9 @@ impl Default for Params {
             tau_slip: 0.45,
             smoothing: SmoothingKind::Naive,
             kn_discount: 0.75,
+            lambda_skip: 0.12,
+            lambda_cache: 0.10,
+            ppm_exclude: false,
             mix: MixMode::Pool,
             n_retrieve: 4,
             n_retrieve_scan: 1024,
