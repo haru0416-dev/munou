@@ -1,28 +1,35 @@
 # 人工無脳君 (`munou`)
 
-LLM を使わず、理解せずに会話が成立する対話プログラム。賢さではなく次の四つを目標にする。
+LLM を使わず、理解せずに会話が成立する対話プログラム。賢さではなく次の四つを目標にする。製品の本線は会話そのものより、**育つ様子を観察すること**。
 
 1. **説明可能** — 応答は生成チェーンと選択スコアで追跡できる (`/why`)
-2. **育てられる** — 語彙・遷移・記憶はユーザー可視。会話ログは毎回残り、コーパスへの吸収は対話中にランダム (`p_learn`)
+2. **育てられる** — 語彙・遷移・記憶はユーザー可視。会話ログは毎回残り、コーパスへの吸収は対話中にランダム (`p_learn`)。ゲージは `munou observe` / `/observe`
 3. **閉じている** — 外部知識なし。知っていることは自分の会話ログ由来
 4. **ズレる** — 文脈からの適度な逸脱は仕様 (`p_slip`)
 
 生成は可変長マルコフ（接尾辞配列の上の最長一致バックオフ）、検索は過去の自分の発話、選択は閉じたハッシュ embedding。生成用言語モデルは無い。既定はこれらの候補をプールして一本を選ぶ（`--mix exclusive` で v0.1 の XOR に戻せる）。会話ログは毎回残し、コーパス（SA・検索・トークナイザ）への吸収は対話中にランダム（`--p-learn`、既定 0.35）。
 
+観察窓のゲージは既存指標だけ（吸収率・語彙・帯域ヒット・1−rote・slip）。感情モデルは足さない。stage（空 / 記録中 / 芽生え / 育ち / 濃い）もカウントから決める。
+
+**アダプタ（伺か SHIORI / Misskey / 常駐）は後段。** いまは CLI だけ。
+
 ```bash
 cargo run -p munou-cli --release -- chat --seed 1 --triggers data/triggers.example.json
+cargo run -p munou-cli --release -- observe --data-dir ./munou-data
+cargo run -p munou-cli --release -- observe --data-dir ./munou-data --format html > observe.html
 ```
 
 ```
-人工無脳君  seed=1  /why /stats /eval /rebuild /retok /explain /quit
+人工無脳君  seed=1  /observe /why /stats /eval /rebuild /retok /explain /quit
 > おはよう
 おはよう
-> /why
-path=Trigger  elapsed=141us  slipped=false (p_slip=0.15 roll=0.402)
+観察 芽生え  吸収██████ 100%  語彙█░░░░░   3  帯域░░░░░░    -  暗記░░░░░░    -  ズレ░░░░░░   -  echo
+> /observe
+人工無脳君 観察窓  stage=芽生え
 ...
 ```
 
-REPL: `/why` トレース、`/stats` コーパス、`/eval` 帯域ヒットと丸暗記 LCS、`/rebuild` SA 再構築、`/retok` ログ全体を再分割。
+REPL: 応答の直後に一行ゲージ。`/observe` が本線、`/why` トレース、`/stats` コーパス、`/eval` 帯域ヒットと丸暗記 LCS、`/rebuild` SA 再構築、`/retok` ログ全体を再分割。`--format html` はローカルの自己完結 HTML（サーバではない）。
 
 同一ログを空から同じシードで再生すると応答列は完全一致する。
 
@@ -41,6 +48,6 @@ cargo run -p munou-cli --release -- probe --seed data/seed.jsonl
 クレート構成:
 
 - `munou-engine` — インターフェース非依存のコア
-- `munou-cli` — 最初のアダプタ。bot / 常駐は後から足す
+- `munou-cli` — 観察窓と REPL。伺か / Misskey / 常駐は後段
 
 設計の本文と v0.1 での決定は [`docs/design.md`](docs/design.md)。
