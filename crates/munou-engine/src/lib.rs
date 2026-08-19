@@ -29,6 +29,7 @@ pub use engine::{Engine, OpenConfig, Reply, Stats};
 pub use error::{Error, Result};
 pub use eval::EvalAccum;
 pub use explain::{CandidateTrace, GenStep, PathKind, Trace, TriggerTrace};
+pub use generate::{lcs_len, lcsubstr_len};
 pub use ids::{is_special, special_name, TokenId, BOS, EOS, FIRST_USER, SEP};
 pub use intern::Interner;
 pub use log::{AppendLog, Record, Role};
