@@ -47,6 +47,9 @@ pub struct Params {
     pub mix: MixMode,
     /// Max retrieved past bot utterances in the pool.
     pub n_retrieve: usize,
+    /// How many recent bot utterances to scan for retrieve / route sim.
+    /// 0 = scan all. Default keeps seed-scale logs unchanged and caps huge logs.
+    pub n_retrieve_scan: usize,
     /// Echo proposals: 1 = exact user text, 2+ adds a mild shuffle.
     pub n_echo: usize,
     /// Subtracted from topic cosine when the source is Echo.
@@ -113,6 +116,7 @@ impl Default for Params {
             kn_discount: 0.75,
             mix: MixMode::Pool,
             n_retrieve: 4,
+            n_retrieve_scan: 1024,
             n_echo: 1,
             echo_penalty: 0.25,
             rote_penalty: 0.50,
