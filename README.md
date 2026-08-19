@@ -29,7 +29,11 @@ REPL: `/why` トレース、`/stats` コーパス、`/eval` 帯域ヒットと�
 ```bash
 cargo run -p munou-cli --release -- bench --tokens 10000000
 # SA-IS n=10000000  ~1.0s   (要件: ≤ 2s)
+
+cargo run -p munou-cli --release -- verify --sa-tokens 10000000 --turns 300
 ```
+
+設計書との突き合わせは [`docs/verify.md`](docs/verify.md)。
 
 クレート構成:
 
