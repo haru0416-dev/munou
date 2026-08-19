@@ -463,15 +463,26 @@ impl Engine {
         }
     }
 
+    fn bot_scan_start(&self) -> usize {
+        let n = self.bots.len();
+        let cap = self.params.n_retrieve_scan;
+        if cap == 0 || cap >= n {
+            0
+        } else {
+            n - cap
+        }
+    }
+
     fn propose_retrieve(&mut self, pool: &mut Pool, input: &str, topic: &[f32], n_retrieve: usize) {
         if self.bots.is_empty() || n_retrieve == 0 {
             return;
         }
         let dim = self.embedder.dim();
         let lambda = self.params.mmr_lambda.clamp(0.0, 1.0);
-        let mut cands: Vec<(f32, usize, Vec<f32>)> = Vec::with_capacity(self.bots.len());
+        let start = self.bot_scan_start();
+        let mut cands: Vec<(f32, usize, Vec<f32>)> = Vec::with_capacity(self.bots.len() - start);
         let mut buf = vec![0.0f32; dim];
-        for (i, (text, _)) in self.bots.iter().enumerate() {
+        for (i, (text, _)) in self.bots.iter().enumerate().skip(start) {
             if text == input {
                 continue;
             }
@@ -585,7 +596,7 @@ impl Engine {
         }
         let mut buf = vec![0.0f32; self.embedder.dim()];
         let mut m = 0.0f32;
-        for (text, _) in &self.bots {
+        for (text, _) in self.bots.iter().skip(self.bot_scan_start()) {
             self.embedder.embed(text, &mut buf);
             m = m.max(cosine(topic, &buf));
         }
