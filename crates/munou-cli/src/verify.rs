@@ -139,6 +139,7 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
     let p1 = Params {
         p_slip: 1.0,
         n_cand: 8,
+        p_learn: 1.0,
         ..Params::default()
     };
     let mut e1 = Engine::ephemeral(p1, 7)?;
@@ -155,6 +156,53 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
         "p_slip=1",
         if slip1 { Status::Pass } else { Status::Fail },
         "slipped when ≥2 candidates".into(),
+    );
+
+    let mut enl = Engine::ephemeral(
+        Params {
+            p_learn: 0.0,
+            p_slip: 0.0,
+            ..Params::default()
+        },
+        3,
+    )?;
+    enl.respond("学習しない")?;
+    enl.respond("まだしない")?;
+    let st0 = enl.stats();
+    check(
+        "p_learn=0",
+        if st0.tokens == 0 && st0.learned == 0 && st0.utterances >= 4 {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        format!(
+            "tokens={} learned={} log={}",
+            st0.tokens, st0.learned, st0.utterances
+        ),
+    );
+
+    let mut eal = Engine::ephemeral(
+        Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        },
+        3,
+    )?;
+    let ral = eal.respond("学習する")?;
+    check(
+        "p_learn=1",
+        if ral.trace.learned && eal.stats().tokens > 0 {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        format!(
+            "learned={} tokens={}",
+            ral.trace.learned,
+            eal.stats().tokens
+        ),
     );
 
     let r = Engine::ephemeral(Params::default(), 9)?.respond("トレース")?;
