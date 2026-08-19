@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.munou/
+munou-data/
+*.jsonl
+!data/seed.jsonl
+.idea/
+.vscode/
+*.swp
+.DS_Store
