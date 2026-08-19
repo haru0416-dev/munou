@@ -3,6 +3,7 @@
 .munou/
 munou-data/
 *.jsonl
+!data/*.jsonl
 .idea/
 .vscode/
 *.swp
