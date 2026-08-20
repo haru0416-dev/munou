@@ -83,8 +83,19 @@ impl EntropyModel {
     }
 
     pub fn observe(&mut self, text: &str) {
+        self.observe_n(text, 1);
+    }
+
+    /// Observe `text` as if it appeared `k` times. Additive counts make this
+    /// bit-identical to `k` plain observes — the closed log repeats the same
+    /// lines heavily (fabricate unique0: 46 distinct in 200k), so replay
+    /// groups by text and pays one hash pass per distinct line.
+    pub fn observe_n(&mut self, text: &str, k: u32) {
+        if k == 0 {
+            return;
+        }
         let chars: Vec<u32> = text.chars().map(|c| c as u32).collect();
-        self.total_chars += chars.len() as u64;
+        self.total_chars += chars.len() as u64 * k as u64;
         for n in 1..=self.max_n {
             if chars.len() < n {
                 continue;
@@ -93,13 +104,13 @@ impl EntropyModel {
                 let key: Box<[u32]> = chars[i..i + n].into();
                 if i > 0 {
                     let be = self.bwd.entry(key.clone()).or_default();
-                    be.count = be.count.saturating_add(1);
-                    *be.next.entry(chars[i - 1]).or_insert(0) += 1;
+                    be.count = be.count.saturating_add(k);
+                    *be.next.entry(chars[i - 1]).or_insert(0) += k;
                 }
                 let e = self.fwd.entry(key).or_default();
-                e.count = e.count.saturating_add(1);
+                e.count = e.count.saturating_add(k);
                 if i + n < chars.len() {
-                    *e.next.entry(chars[i + n]).or_insert(0) += 1;
+                    *e.next.entry(chars[i + n]).or_insert(0) += k;
                 }
             }
         }
@@ -184,6 +195,11 @@ impl Tokenizer {
 
     pub fn observe(&mut self, text: &str) {
         self.model.observe(text);
+    }
+
+    /// Weighted observe for replay: identical counts to `k` plain observes.
+    pub(crate) fn observe_n(&mut self, text: &str, k: u32) {
+        self.model.observe_n(text, k);
     }
 
     pub fn tokenize(&self, intern: &mut Interner, text: &str) -> Tokenized {
@@ -398,6 +414,22 @@ mod tests {
             morphs.iter().any(|m| m.contains("らー")),
             "run should cross the prolonged mark: {morphs:?}"
         );
+    }
+
+    /// Weighted observe must reproduce k repeated observes exactly — the
+    /// segmentation (which depends only on the counts) must not differ.
+    #[test]
+    fn observe_n_equals_repeated_observe() {
+        let corpus = "東京都の天気は晴れ。大阪府の天気は雨。らーめんたべたい。";
+        let mut a = Tokenizer::new(&Params::default());
+        for _ in 0..40 {
+            a.observe(corpus);
+        }
+        let mut b = Tokenizer::new(&Params::default());
+        b.observe_n(corpus, 40);
+        for probe in ["東京都の天気は晴れ", "らーめん", corpus] {
+            assert_eq!(a.morphemes(probe), b.morphemes(probe), "probe={probe}");
+        }
     }
 
     #[test]

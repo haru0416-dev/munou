@@ -11,12 +11,12 @@ use crate::embed::{cosine, Embedder, HashEmbedder, TopicTracker};
 use crate::error::Result;
 use crate::eval::EvalAccum;
 use crate::explain::{GenStep, PathKind, Trace};
-use crate::generate::{generate_one, Generated, NextMemo};
+use crate::generate::{generate_one, GenCaches, Generated};
 use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
 use crate::log::{AppendLog, Record, Role};
 use crate::mix::Pool;
-use crate::observe::Observe;
+use crate::observe::{LogDigest, Observe};
 use crate::params::{MixMode, Params, SmoothingKind};
 use crate::retrieve::BotStore;
 use crate::route;
@@ -80,6 +80,13 @@ pub struct Engine {
     path_prior: [f32; 5],
     /// Last bot path, restored from the log so `/good` works after reopen.
     last_path: Option<PathKind>,
+    /// Incremental log digest: counts/paths/last-bot for stats and gauges,
+    /// updated per append instead of rescanning the whole log per turn.
+    digest: LogDigest,
+    /// Cross-turn generation caches (counts + frozen distributions), valid
+    /// until the corpus changes: absorb clears, non-learning turns reuse.
+    gen_caches: GenCaches,
+    gen_caches_rev: GenCaches,
     /// Last `self_window` own reply texts for the self-repetition penalty.
     /// Text, not tokens: the penalty is char-level so live and replay agree
     /// exactly (token ids drift across reopen).
@@ -154,6 +161,7 @@ impl Engine {
         for rec in &log.records {
             eval.ingest_bot(rec, &cfg.params);
         }
+        let digest = LogDigest::scan(&log.records);
 
         let mut smoothing = smoothing::boxed(cfg.params.smoothing, cfg.params.kn_discount);
         smoothing::sync_to_store(smoothing.as_mut(), &cfg.params, &store);
@@ -177,6 +185,9 @@ impl Engine {
             rev_store,
             path_prior,
             last_path: last_bot_path,
+            digest,
+            gen_caches: GenCaches::default(),
+            gen_caches_rev: GenCaches::default(),
             recent_bot,
         })
     }
@@ -189,6 +200,8 @@ impl Engine {
 
     pub fn respond(&mut self, input: &str) -> Result<Reply> {
         let t0 = Instant::now();
+        self.gen_caches.trim();
+        self.gen_caches_rev.trim();
         let input = input.trim();
         let tok = self.tokenizer.tokenize(&mut self.intern, input);
 
@@ -289,18 +302,19 @@ impl Engine {
         };
 
         self.eval.observe(&trace, chosen_tokens.len());
-        self.log.append_turn(
-            Record::user(input.to_string(), learned),
-            Record::bot(
-                chosen_text.clone(),
-                learned,
-                sim,
-                ranked.slipped,
-                path,
-                novelty_lcs,
-                chosen_tokens.len(),
-            ),
-        )?;
+        let rec_user = Record::user(input.to_string(), learned);
+        let rec_bot = Record::bot(
+            chosen_text.clone(),
+            learned,
+            sim,
+            ranked.slipped,
+            path,
+            novelty_lcs,
+            chosen_tokens.len(),
+        );
+        self.digest.ingest(&rec_user);
+        self.digest.ingest(&rec_bot);
+        self.log.append_turn(rec_user, rec_bot)?;
         if learned {
             self.absorb(Role::User, input, &tok.chunks);
             self.absorb(Role::Bot, &chosen_text, &chosen_tokens);
@@ -445,6 +459,8 @@ impl Engine {
         if chunks.is_empty() {
             return;
         }
+        self.gen_caches.clear();
+        self.gen_caches_rev.clear();
         self.store.push_utterance(chunks);
         if self.params.bidir {
             let rev: Vec<TokenId> = chunks.iter().rev().copied().collect();
@@ -482,8 +498,6 @@ impl Engine {
         // candidate slots try this when an anchor exists.
         let anchor = self.pick_anchor(user_chunks);
         let n_bi = if anchor.is_some() { n_cand / 2 } else { 0 };
-        let mut memo = NextMemo::default();
-        let mut memo_rev = NextMemo::default();
         let mut seen = FxHashSet::default();
         let mut attempts = 0;
         let start = pool.items.len();
@@ -491,7 +505,7 @@ impl Engine {
             attempts += 1;
             let g = if pool.items.len() - start < n_bi {
                 let anchor = anchor.expect("n_bi > 0 implies anchor");
-                self.gen_anchored(anchor, kn, &mut memo, &mut memo_rev)
+                self.gen_anchored(anchor, kn)
             } else {
                 let uni = self.store.sampling_view(kn).expect("warmed above");
                 generate_one(
@@ -501,7 +515,7 @@ impl Engine {
                     &ctx_seed,
                     &parrot,
                     uni,
-                    &mut memo,
+                    &mut self.gen_caches,
                     &mut self.rng,
                 )
             };
@@ -573,13 +587,7 @@ impl Engine {
     /// on the normal store, then leftward growth on the reversed-stream twin
     /// (a suffix walk there predicts the *preceding* chunk). MegaHAL's
     /// two-model trick with both models being the same SA machinery.
-    fn gen_anchored(
-        &mut self,
-        anchor: TokenId,
-        kn: bool,
-        memo: &mut NextMemo,
-        memo_rev: &mut NextMemo,
-    ) -> Generated {
+    fn gen_anchored(&mut self, anchor: TokenId, kn: bool) -> Generated {
         self.store.warm_sampling(kn);
         self.rev_store.warm_sampling(kn);
         let uni = self.store.sampling_view(kn).expect("warmed above");
@@ -590,7 +598,7 @@ impl Engine {
             &[anchor],
             &[],
             uni,
-            memo,
+            &mut self.gen_caches,
             &mut self.rng,
         );
         let mut seq = vec![anchor];
@@ -606,7 +614,7 @@ impl Engine {
             &rev_ctx,
             &[],
             uni_rev,
-            memo_rev,
+            &mut self.gen_caches_rev,
             &mut self.rng,
         );
         let mut tokens: Vec<TokenId> = bwd.tokens.iter().rev().copied().collect();
@@ -669,10 +677,9 @@ impl Engine {
             self.params.pref_step,
             self.params.pref_clip,
         );
-        self.log.append(Record::meta(
-            if good { "good".into() } else { "bad".into() },
-            Some(path),
-        ))?;
+        let rec = Record::meta(if good { "good".into() } else { "bad".into() }, Some(path));
+        self.digest.ingest(&rec);
+        self.log.append(rec)?;
         Ok(format!(
             "pref {} {:?}  prior={:+.2}",
             if good { "good" } else { "bad" },
@@ -682,24 +689,9 @@ impl Engine {
     }
 
     pub fn stats(&self) -> Stats {
-        let episodic = self
-            .log
-            .records
-            .iter()
-            .filter(|r| r.role != Role::Meta)
-            .count();
-        let meta = self
-            .log
-            .records
-            .iter()
-            .filter(|r| r.role == Role::Meta)
-            .count();
-        let learned = self
-            .log
-            .records
-            .iter()
-            .filter(|r| r.role != Role::Meta && r.learned)
-            .count();
+        let episodic = self.digest.speech;
+        let meta = self.digest.meta;
+        let learned = self.digest.learned;
         Stats {
             utterances: episodic,
             learned,
@@ -722,7 +714,7 @@ impl Engine {
         Observe::from_parts(
             &self.stats(),
             &self.params,
-            &self.log.records,
+            &self.digest,
             self.last_trace.as_ref(),
             &self.eval,
         )
@@ -746,7 +738,6 @@ impl Engine {
         let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
         self.store.warm_sampling(kn);
         let uni = self.store.sampling_view(kn).expect("warmed above");
-        let mut memo = NextMemo::default();
         generate_one(
             &self.store,
             self.smoothing.as_ref(),
@@ -754,7 +745,7 @@ impl Engine {
             &ctx,
             &parrot,
             uni,
-            &mut memo,
+            &mut self.gen_caches,
             &mut self.rng,
         )
         .tokens
@@ -784,6 +775,8 @@ impl Engine {
         self.recent_bot = replayed.recent_bot;
         self.pairs = replayed.pairs;
         self.rev_store = replayed.rev_store;
+        self.gen_caches.clear();
+        self.gen_caches_rev.clear();
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
@@ -856,11 +849,24 @@ fn replay_speech(
     tokenizer: &mut Tokenizer,
     recs: &[(Role, &str, bool)],
 ) -> Replayed {
-    for (role, text, learned) in recs {
-        if *role == Role::Meta || !*learned {
-            continue;
+    // The closed log repeats lines heavily; observe each distinct text once
+    // with its multiplicity (bit-identical counts, one hash pass per line).
+    {
+        let mut weights: rustc_hash::FxHashMap<&str, u32> = rustc_hash::FxHashMap::default();
+        let mut order: Vec<&str> = Vec::new();
+        for (role, text, learned) in recs {
+            if *role == Role::Meta || !*learned {
+                continue;
+            }
+            let w = weights.entry(text).or_insert(0);
+            if *w == 0 {
+                order.push(text);
+            }
+            *w += 1;
         }
-        tokenizer.observe(text);
+        for t in order {
+            tokenizer.observe_n(t, weights[t]);
+        }
     }
 
     let mut intern = Interner::new();
@@ -880,11 +886,17 @@ fn replay_speech(
         .count();
     let k_topic = params.k_topic.max(1);
     let mut user_idx = 0usize;
+    // Tokenisation is a pure function during replay (the entropy model is
+    // fully trained above and frozen), so repeated texts tokenise once.
+    let mut tok_memo: rustc_hash::FxHashMap<&str, Tokenized> = rustc_hash::FxHashMap::default();
     for (role, text, learned) in recs {
         if *role == Role::Meta {
             continue;
         }
-        let tok = tokenizer.tokenize(&mut intern, text);
+        let tok = tok_memo
+            .entry(text)
+            .or_insert_with(|| tokenizer.tokenize(&mut intern, text))
+            .clone();
         if *learned {
             store.push_utterance_deferred(&tok.chunks);
             if params.bidir {

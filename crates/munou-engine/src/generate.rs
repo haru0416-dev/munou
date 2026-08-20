@@ -12,7 +12,32 @@ use crate::store::{SamplingUnigram, Store};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 
-pub(crate) type NextMemo = FxHashMap<Vec<TokenId>, (Vec<(TokenId, u32)>, u32)>;
+pub(crate) type NextMemo = FxHashMap<Vec<TokenId>, std::sync::Arc<(Vec<(TokenId, u32)>, u32)>>;
+
+/// Generation caches shared across candidates and, until the next absorb,
+/// across turns: exact next-token counts per context (`memo`, the KV-cache
+/// analog) and frozen sparse distributions per context (`dists`). Both are
+/// pure functions of the corpus, so the owner clears them whenever the
+/// corpus changes and `trim` bounds memory on long non-learning stretches.
+#[derive(Default)]
+pub(crate) struct GenCaches {
+    pub memo: NextMemo,
+    pub dists: FxHashMap<Vec<TokenId>, crate::sparse::FrozenSparse>,
+}
+
+impl GenCaches {
+    pub fn clear(&mut self) {
+        self.memo.clear();
+        self.dists.clear();
+    }
+
+    /// Deterministic size guard (no clock, no randomness).
+    pub fn trim(&mut self) {
+        if self.dists.len() > 4096 || self.memo.len() > 65536 {
+            self.clear();
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Generated {
@@ -22,18 +47,18 @@ pub struct Generated {
 
 /// `uni` is the store's warmed sampling unigram (continuation for KN, ML
 /// otherwise), hoisted out so it is built once per corpus change instead of
-/// once per generation step. `memo` caches next-token counts per exact
-/// context; the caller may share it across candidates of the same turn (the
-/// store cannot change mid-turn, so entries stay valid).
+/// once per generation step. `caches` carries next-token counts and frozen
+/// distributions per exact context; the caller shares it across candidates
+/// and across turns, clearing on any corpus change.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_one<R: Rng + ?Sized>(
+pub(crate) fn generate_one<R: Rng + ?Sized>(
     store: &Store,
     smoothing: &dyn Smoothing,
     params: &Params,
     ctx_seed: &[TokenId],
     parrot: &[TokenId],
     uni: SamplingUnigram<'_>,
-    memo: &mut NextMemo,
+    caches: &mut GenCaches,
     rng: &mut R,
 ) -> Generated {
     let mut tokens: Vec<TokenId> = Vec::new();
@@ -65,14 +90,21 @@ pub fn generate_one<R: Rng + ?Sized>(
         let requested = ctx.len();
         let (sampled, p, used_len, freq) = if fast {
             match sparse_step(
-                store, smoothing, params, &ctx, parrot, uni, u_total, memo, rng,
+                store, smoothing, params, &ctx, parrot, uni, u_total, caches, rng,
             ) {
                 Some(v) => v,
                 None => break,
             }
         } else {
-            let (mut ids, mut weights, used_len, freq) =
-                dist_with_backoff(store, smoothing, params, &ctx, parrot, uni.dist, memo);
+            let (mut ids, mut weights, used_len, freq) = dist_with_backoff(
+                store,
+                smoothing,
+                params,
+                &ctx,
+                parrot,
+                uni.dist,
+                &mut caches.memo,
+            );
             if ids.is_empty() {
                 break;
             }
@@ -148,17 +180,18 @@ pub(crate) fn dist_with_backoff(
         params.ppm_exclude || matches!(params.smoothing, crate::params::SmoothingKind::Kn);
     for len in 1..=ctx.len() {
         let sub = &ctx[ctx.len() - len..];
-        let (counts, total) = lookup_counts(store, memo, sub);
+        let hit = lookup_counts(store, memo, sub);
+        let (counts, total) = (&hit.0, hit.1);
         if total == 0 {
             continue;
         }
         let n1plus = counts.len() as u32;
         let lower = if exclude {
-            Cow::Owned(exclude_seen(&backoff, &counts))
+            Cow::Owned(exclude_seen(&backoff, counts))
         } else {
             backoff
         };
-        backoff = Cow::Owned(smoothing.distribute(&counts, total, n1plus, &lower));
+        backoff = Cow::Owned(smoothing.distribute(counts, total, n1plus, &lower));
         if total >= params.f_min || freq < params.f_min {
             used = len;
             freq = total;
@@ -171,9 +204,9 @@ pub(crate) fn dist_with_backoff(
     if sparse && params.lambda_skip > 0.0 && ctx.len() >= 3 {
         let mut skip = ctx.to_vec();
         skip.remove(skip.len() - 2);
-        let (counts, total) = lookup_counts(store, memo, &skip);
-        if total > 0 {
-            let extra = counts_to_ml(&counts, total);
+        let hit = lookup_counts(store, memo, &skip);
+        if hit.1 > 0 {
+            let extra = counts_to_ml(&hit.0, hit.1);
             backoff = Cow::Owned(mix_lambda(&backoff, &extra, params.lambda_skip));
         }
     }
@@ -202,15 +235,13 @@ pub(crate) fn lookup_counts(
     store: &Store,
     memo: &mut NextMemo,
     ctx: &[TokenId],
-) -> (Vec<(TokenId, u32)>, u32) {
-    let key = ctx.to_vec();
-    if let Some(hit) = memo.get(&key) {
-        hit.clone()
-    } else {
-        let got = store.next_counts(ctx);
-        memo.insert(key, got.clone());
-        got
+) -> std::sync::Arc<(Vec<(TokenId, u32)>, u32)> {
+    if let Some(hit) = memo.get(ctx) {
+        return hit.clone();
     }
+    let got = std::sync::Arc::new(store.next_counts(ctx));
+    memo.insert(ctx.to_vec(), got.clone());
+    got
 }
 
 /// PPM-C: types already seen at this order are removed from the backoff and
@@ -362,8 +393,8 @@ mod tests {
         let kn = matches!(params.smoothing, crate::params::SmoothingKind::Kn);
         store.warm_sampling(kn);
         let uni = store.sampling_view(kn).expect("warmed");
-        let mut memo = NextMemo::default();
-        generate_one(store, smoothing, params, ctx, parrot, uni, &mut memo, rng)
+        let mut caches = GenCaches::default();
+        generate_one(store, smoothing, params, ctx, parrot, uni, &mut caches, rng)
     }
 
     #[test]

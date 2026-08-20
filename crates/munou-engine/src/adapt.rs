@@ -56,16 +56,23 @@ impl PairStore {
         });
     }
 
-    /// Trim to the scan window, then embed. Called once at end of replay.
+    /// Trim to the scan window, then embed — one embed per distinct user
+    /// text (see `BotStore::finish`). Called once at end of replay.
     pub fn finish(&mut self, embedder: &HashEmbedder, scan_cap: usize) {
         if scan_cap > 0 && self.items.len() > scan_cap {
             let cut = self.items.len() - scan_cap;
             self.items.drain(..cut);
         }
+        let mut memo: rustc_hash::FxHashMap<String, Vec<f32>> = rustc_hash::FxHashMap::default();
         for p in self.items.iter_mut() {
-            let mut v = vec![0.0f32; embedder.dim()];
-            embedder.embed(&p.user_text, &mut v);
-            p.emb = v;
+            p.emb = memo
+                .entry(p.user_text.clone())
+                .or_insert_with(|| {
+                    let mut v = vec![0.0f32; embedder.dim()];
+                    embedder.embed(&p.user_text, &mut v);
+                    v
+                })
+                .clone();
         }
     }
 

@@ -50,6 +50,73 @@ impl Stage {
     }
 }
 
+/// Incremental digest of the JSONL log. The log is append-only, so the
+/// engine ingests each record once instead of rescanning every record on
+/// every gauge refresh (the old panel walked the whole log per turn —
+/// O(N) on grown logs, 5.4% of a chat process in the 200k-utterance profile).
+#[derive(Debug, Clone, Default)]
+pub struct LogDigest {
+    /// Non-meta records.
+    pub speech: usize,
+    pub meta: usize,
+    /// Non-meta records absorbed into the corpus.
+    pub learned: usize,
+    /// Winning-path counts, indexed like `route::prior_index`.
+    pub paths: [u32; 5],
+    pub path_known: u32,
+    /// Latest bot record's surface facts (fallback for last_* after reopen).
+    pub last_bot: Option<LastBot>,
+    /// Last ≤5 learned bot texts, oldest first.
+    pub recent_learned_bot: std::collections::VecDeque<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LastBot {
+    pub path: Option<PathKind>,
+    pub learned: bool,
+    pub score: Option<f32>,
+    pub slipped: Option<bool>,
+}
+
+impl LogDigest {
+    pub fn scan(records: &[Record]) -> Self {
+        let mut d = Self::default();
+        for rec in records {
+            d.ingest(rec);
+        }
+        d
+    }
+
+    pub fn ingest(&mut self, rec: &Record) {
+        if rec.role == Role::Meta {
+            self.meta += 1;
+            return;
+        }
+        self.speech += 1;
+        if rec.learned {
+            self.learned += 1;
+        }
+        if rec.role == Role::Bot {
+            if let Some(p) = rec.path {
+                self.paths[crate::route::prior_index(p)] += 1;
+                self.path_known += 1;
+            }
+            self.last_bot = Some(LastBot {
+                path: rec.path,
+                learned: rec.learned,
+                score: rec.score,
+                slipped: rec.slipped,
+            });
+            if rec.learned {
+                self.recent_learned_bot.push_back(rec.text.clone());
+                while self.recent_learned_bot.len() > 5 {
+                    self.recent_learned_bot.pop_front();
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Observe {
     pub utterances: usize,
@@ -95,7 +162,7 @@ impl Observe {
     pub fn from_parts(
         stats: &Stats,
         params: &Params,
-        records: &[Record],
+        digest: &LogDigest,
         last: Option<&Trace>,
         eval: &EvalAccum,
     ) -> Self {
@@ -123,27 +190,15 @@ impl Observe {
             )
         };
 
-        let mut path_trig = 0u32;
-        let mut path_retr = 0u32;
-        let mut path_mark = 0u32;
-        let mut path_echo = 0u32;
-        let mut path_adpt = 0u32;
-        for rec in records {
-            if rec.role != Role::Bot {
-                continue;
-            }
-            match rec.path {
-                Some(PathKind::Trigger) => path_trig += 1,
-                Some(PathKind::Retrieve) => path_retr += 1,
-                Some(PathKind::Markov) => path_mark += 1,
-                Some(PathKind::Echo) => path_echo += 1,
-                Some(PathKind::Adapt) => path_adpt += 1,
-                None => {}
-            }
-        }
-        let path_known = path_trig + path_retr + path_mark + path_echo + path_adpt;
+        let idx = |p: PathKind| digest.paths[crate::route::prior_index(p)];
+        let path_trig = idx(PathKind::Trigger);
+        let path_retr = idx(PathKind::Retrieve);
+        let path_mark = idx(PathKind::Markov);
+        let path_echo = idx(PathKind::Echo);
+        let path_adpt = idx(PathKind::Adapt);
+        let path_known = digest.path_known;
 
-        let last_bot = records.iter().rev().find(|r| r.role == Role::Bot);
+        let last_bot = digest.last_bot.as_ref();
         let last_path = last
             .map(|t| t.path)
             .or_else(|| last_bot.and_then(|r| r.path));
@@ -172,16 +227,7 @@ impl Observe {
             })
         });
 
-        let mut recent_learned_bot = Vec::new();
-        for rec in records.iter().rev() {
-            if rec.role == Role::Bot && rec.learned {
-                recent_learned_bot.push(rec.text.clone());
-                if recent_learned_bot.len() >= 5 {
-                    break;
-                }
-            }
-        }
-        recent_learned_bot.reverse();
+        let recent_learned_bot: Vec<String> = digest.recent_learned_bot.iter().cloned().collect();
 
         let stage = Stage::from_counts(stats.utterances, stats.learned, stats.tokens);
         let rote_lean = eval.n > 0 && rote_lcs >= 0.65;
@@ -580,7 +626,7 @@ mod tests {
         let o = Observe::from_parts(
             &empty_stats(),
             &Params::default(),
-            &[],
+            &LogDigest::default(),
             None,
             &EvalAccum::default(),
         );
@@ -597,7 +643,13 @@ mod tests {
     #[test]
     fn logged_unlearned_is_not_sprout() {
         let st = stats(4, 0, 0, 0, 0, 0);
-        let o = Observe::from_parts(&st, &Params::default(), &[], None, &EvalAccum::default());
+        let o = Observe::from_parts(
+            &st,
+            &Params::default(),
+            &LogDigest::default(),
+            None,
+            &EvalAccum::default(),
+        );
         assert_eq!(o.stage, Stage::Logged);
         assert_eq!(o.stage.label(), "記録中");
     }
@@ -617,7 +669,13 @@ mod tests {
             novelty_lcs: None,
             n_tok: None,
         };
-        let o = Observe::from_parts(&st, &Params::default(), &[rec], None, &EvalAccum::default());
+        let o = Observe::from_parts(
+            &st,
+            &Params::default(),
+            &LogDigest::scan(&[rec]),
+            None,
+            &EvalAccum::default(),
+        );
         let h = o.html();
         assert!(h.contains("&lt;script&gt;"), "{h}");
         assert!(!h.contains("<script>x"), "{h}");

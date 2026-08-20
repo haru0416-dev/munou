@@ -37,16 +37,24 @@ impl BotStore {
     }
 
     /// Drop entries that can never enter the scan window again, then fill
-    /// embeddings. Called once at the end of open / retokenize.
+    /// embeddings — one embed per distinct text (the log repeats lines
+    /// heavily; the embedder is deterministic). Called once at the end of
+    /// open / retokenize.
     pub fn finish(&mut self, embedder: &HashEmbedder, scan_cap: usize) {
         if scan_cap > 0 && self.items.len() > scan_cap {
             let cut = self.items.len() - scan_cap;
             self.items.drain(..cut);
         }
+        let mut memo: rustc_hash::FxHashMap<String, Vec<f32>> = rustc_hash::FxHashMap::default();
         for b in self.items.iter_mut() {
-            let mut v = vec![0.0f32; embedder.dim()];
-            embedder.embed(&b.text, &mut v);
-            b.emb = v;
+            b.emb = memo
+                .entry(b.text.clone())
+                .or_insert_with(|| {
+                    let mut v = vec![0.0f32; embedder.dim()];
+                    embedder.embed(&b.text, &mut v);
+                    v
+                })
+                .clone();
         }
     }
 

@@ -6,7 +6,7 @@
 use rand::Rng;
 
 use crate::alias::AliasTable;
-use crate::generate::{counts_to_ml, lookup_counts, parrot_unigram, NextMemo};
+use crate::generate::{counts_to_ml, lookup_counts, parrot_unigram, GenCaches};
 use crate::ids::TokenId;
 use crate::params::Params;
 use crate::smoothing::Smoothing;
@@ -188,16 +188,36 @@ impl SparseDist {
         }
     }
 
+    fn mass_explicit(&self) -> f64 {
+        self.vals.iter().map(|v| v.max(0.0)).sum()
+    }
+
     /// Two-level draw: alias over the explicit support, or the cached unigram
     /// alias for the tail with rejection of promoted ids. Returns the token
-    /// and its normalised probability.
+    /// and its normalised probability. (Production goes through
+    /// `FrozenSparse::sample`; this stays for the distribution tests.)
+    #[cfg(test)]
     fn sample<R: Rng + ?Sized>(
         &self,
         uni: &SamplingUnigram<'_>,
         u_total: f64,
         rng: &mut R,
     ) -> Option<(TokenId, f32)> {
-        let m_s: f64 = self.vals.iter().map(|v| v.max(0.0)).sum();
+        let table = AliasTable::from_weights(&self.vals);
+        self.sample_with(&table, self.mass_explicit(), uni, u_total, rng)
+    }
+
+    /// Draw with a prebuilt explicit-support alias and mass — identical
+    /// arithmetic and RNG consumption to `sample`; lets a frozen copy reuse
+    /// the table across draws of the same context.
+    fn sample_with<R: Rng + ?Sized>(
+        &self,
+        table: &AliasTable,
+        m_s: f64,
+        uni: &SamplingUnigram<'_>,
+        u_total: f64,
+        rng: &mut R,
+    ) -> Option<(TokenId, f32)> {
         let m_t = (self.tail * (u_total - self.umass)).max(0.0);
         let z = m_s + m_t;
         if z <= 0.0 {
@@ -205,7 +225,6 @@ impl SparseDist {
         }
         let r: f64 = rng.gen::<f64>() * z;
         if r < m_s || m_t <= 0.0 {
-            let table = AliasTable::from_weights(&self.vals);
             let i = table.sample(rng);
             let p = (self.vals[i].max(0.0) / z) as f32;
             Some((self.ids[i], p))
@@ -238,6 +257,43 @@ impl SparseDist {
     }
 }
 
+/// A built distribution frozen for reuse: the sparse mixture plus its
+/// explicit-support alias and mass. Candidates fan out from identical
+/// contexts and 65% of turns leave the corpus untouched (p_learn), so the
+/// same context recurs both within a turn and across turns — the engine
+/// caches these keyed by context and invalidates on absorb.
+pub(crate) struct FrozenSparse {
+    dist: SparseDist,
+    table: AliasTable,
+    m_s: f64,
+    pub used: usize,
+    pub freq: u32,
+}
+
+impl FrozenSparse {
+    fn new(dist: SparseDist, used: usize, freq: u32) -> Self {
+        let table = AliasTable::from_weights(&dist.vals);
+        let m_s = dist.mass_explicit();
+        Self {
+            dist,
+            table,
+            m_s,
+            used,
+            freq,
+        }
+    }
+
+    pub fn sample<R: Rng + ?Sized>(
+        &self,
+        uni: &SamplingUnigram<'_>,
+        u_total: f64,
+        rng: &mut R,
+    ) -> Option<(TokenId, f32)> {
+        self.dist
+            .sample_with(&self.table, self.m_s, uni, u_total, rng)
+    }
+}
+
 /// One decode step on the sparse representation. Same interpolation maths as
 /// `dist_with_backoff`; returns (token, p, used_len, freq) or None to stop.
 #[allow(clippy::too_many_arguments)]
@@ -249,11 +305,18 @@ pub(crate) fn sparse_step<R: Rng + ?Sized>(
     parrot: &[TokenId],
     uni: SamplingUnigram<'_>,
     u_total: f64,
-    memo: &mut NextMemo,
+    caches: &mut crate::generate::GenCaches,
     rng: &mut R,
 ) -> Option<(TokenId, f32, usize, u32)> {
-    let (dist, used, freq) = sparse_dist(store, smoothing, params, ctx, uni, u_total, memo);
-    match dist.sample(&uni, u_total, rng) {
+    if !caches.dists.contains_key(ctx) {
+        let (dist, used, freq) = sparse_dist(store, smoothing, params, ctx, uni, u_total, caches);
+        caches
+            .dists
+            .insert(ctx.to_vec(), FrozenSparse::new(dist, used, freq));
+    }
+    let frozen = caches.dists.get(ctx).expect("inserted above");
+    let (used, freq) = (frozen.used, frozen.freq);
+    match frozen.sample(&uni, u_total, rng) {
         Some((id, p)) => Some((id, p, used, freq)),
         None => {
             // Mirror the dense path: an empty distribution falls back to the
@@ -284,7 +347,7 @@ pub(crate) fn sparse_dist(
     ctx: &[TokenId],
     uni: SamplingUnigram<'_>,
     u_total: f64,
-    memo: &mut NextMemo,
+    caches: &mut GenCaches,
 ) -> (SparseDist, usize, u32) {
     let mut dist = SparseDist::new();
     let mut used = 0usize;
@@ -294,16 +357,17 @@ pub(crate) fn sparse_dist(
     let kn_ds = smoothing.mkn_discounts();
     for len in 1..=ctx.len() {
         let sub = &ctx[ctx.len() - len..];
-        let (counts, total) = lookup_counts(store, memo, sub);
+        let hit = lookup_counts(store, &mut caches.memo, sub);
+        let (counts, total) = (&hit.0, hit.1);
         if total == 0 {
             continue;
         }
         if exclude {
-            dist.exclude(&counts, &uni, u_total);
+            dist.exclude(counts, &uni, u_total);
         }
         match kn_ds {
-            Some((d1, d2, d3)) => dist.kn_order(&counts, total, d1, d2, d3, &uni, u_total),
-            None => dist.wb_order(&counts, total, &uni),
+            Some((d1, d2, d3)) => dist.kn_order(counts, total, d1, d2, d3, &uni, u_total),
+            None => dist.wb_order(counts, total, &uni),
         }
         if total >= params.f_min || freq < params.f_min {
             used = len;
@@ -315,9 +379,9 @@ pub(crate) fn sparse_dist(
     if sparse_ctx && params.lambda_skip > 0.0 && ctx.len() >= 3 {
         let mut skip = ctx.to_vec();
         skip.remove(skip.len() - 2);
-        let (counts, total) = lookup_counts(store, memo, &skip);
-        if total > 0 {
-            let extra = counts_to_ml(&counts, total);
+        let hit = lookup_counts(store, &mut caches.memo, &skip);
+        if hit.1 > 0 {
+            let extra = counts_to_ml(&hit.0, hit.1);
             dist.mix(&extra, params.lambda_skip, &uni, u_total);
         }
     }
@@ -399,7 +463,7 @@ mod tests {
             let u_total: f64 = uni.dist.iter().map(|(_, p)| *p).sum();
 
             for ctx in &contexts {
-                let mut memo_d = NextMemo::default();
+                let mut memo_d = crate::generate::NextMemo::default();
                 let (ids, w, used_d, freq_d) = dist_with_backoff(
                     &store,
                     sm.as_ref(),
@@ -412,9 +476,16 @@ mod tests {
                 let z_d: f64 = w.iter().copied().filter(|x| *x > 0.0).sum();
                 assert!(z_d > 0.0, "dense empty for ctx={ctx:?}");
 
-                let mut memo_s = NextMemo::default();
-                let (sd, used_s, freq_s) =
-                    sparse_dist(&store, sm.as_ref(), &params, ctx, uni, u_total, &mut memo_s);
+                let mut caches_s = GenCaches::default();
+                let (sd, used_s, freq_s) = sparse_dist(
+                    &store,
+                    sm.as_ref(),
+                    &params,
+                    ctx,
+                    uni,
+                    u_total,
+                    &mut caches_s,
+                );
                 let z_s = sd.total(u_total);
                 assert!(z_s > 0.0);
                 assert_eq!((used_d, freq_d), (used_s, freq_s), "ctx={ctx:?}");
@@ -460,8 +531,8 @@ mod tests {
         let uni = store.sampling_view(false).expect("warmed");
         let u_total: f64 = uni.dist.iter().map(|(_, p)| *p).sum();
         let ctx = vec![20u32];
-        let mut memo = NextMemo::default();
-        let (sd, _, _) = sparse_dist(&store, &sm, &params, &ctx, uni, u_total, &mut memo);
+        let mut caches = GenCaches::default();
+        let (sd, _, _) = sparse_dist(&store, &sm, &params, &ctx, uni, u_total, &mut caches);
         let z = sd.total(u_total);
         let mut rng = ChaCha8Rng::seed_from_u64(11);
         let n = 60_000usize;
