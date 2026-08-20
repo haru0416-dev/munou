@@ -165,7 +165,8 @@ impl Engine {
             eval.ingest_bot(rec, &cfg.params);
         }
 
-        let smoothing = smoothing::boxed(cfg.params.smoothing, cfg.params.kn_discount);
+        let mut smoothing = smoothing::boxed(cfg.params.smoothing, cfg.params.kn_discount);
+        smoothing::sync_to_store(smoothing.as_mut(), &cfg.params, &store);
         Ok(Self {
             intern,
             tokenizer,
@@ -398,6 +399,7 @@ impl Engine {
         if role == Role::Bot {
             self.bots.push((text.to_string(), chunks.to_vec()));
         }
+        smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
     }
 
     fn propose_markov(
@@ -537,6 +539,7 @@ impl Engine {
 
     pub fn rebuild(&mut self) -> Result<()> {
         self.store.merge();
+        smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
 
@@ -717,6 +720,7 @@ impl Engine {
         }
         self.store.merge();
         trim_history(&mut self.history, self.params.l_max_capped() * 4);
+        smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
 }

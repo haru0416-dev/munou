@@ -44,5 +44,5 @@ pub use tokenizer::{detokenize, Tokenizer};
 pub use trigger::TriggerDict;
 
 pub use embed::{cosine, Embedder, HashEmbedder, TopicTracker};
-pub use smoothing::{KneserNey, NaiveBackoff, Smoothing};
+pub use smoothing::{chen_goodman, KneserNey, NaiveBackoff, Smoothing};
 pub use store::Store;

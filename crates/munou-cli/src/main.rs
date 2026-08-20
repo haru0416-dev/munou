@@ -152,9 +152,18 @@ struct Common {
     /// Band-hinge weight on the selector.
     #[arg(long)]
     band_penalty: Option<f32>,
-    /// Smoothing: naive | kn
+    /// Smoothing: naive (Witten-Bell) | kn (modified Kneser-Ney; not KenLM)
     #[arg(long)]
     smoothing: Option<String>,
+    /// Skip-gram mix weight on sparse contexts. 0 disables.
+    #[arg(long)]
+    lambda_skip: Option<f64>,
+    /// Recency-cache mix weight on sparse contexts. 0 disables.
+    #[arg(long)]
+    lambda_cache: Option<f64>,
+    /// PPM-C exclusion for Witten-Bell (modified KN already excludes).
+    #[arg(long)]
+    ppm: bool,
     /// Candidate mix: pool (default) | exclusive (v0.1 XOR)
     #[arg(long)]
     mix: Option<String>,
@@ -312,9 +321,18 @@ fn params_from(c: &Common) -> Params {
     }
     if let Some(s) = &c.smoothing {
         p.smoothing = match s.to_ascii_lowercase().as_str() {
-            "kn" | "kneser-ney" | "kneserney" => SmoothingKind::Kn,
+            "kn" | "kneser-ney" | "kneserney" | "mkn" | "modified-kn" => SmoothingKind::Kn,
             _ => SmoothingKind::Naive,
         };
+    }
+    if let Some(x) = c.lambda_skip {
+        p.lambda_skip = x.clamp(0.0, 1.0);
+    }
+    if let Some(x) = c.lambda_cache {
+        p.lambda_cache = x.clamp(0.0, 1.0);
+    }
+    if c.ppm {
+        p.ppm_exclude = true;
     }
     if let Some(m) = &c.mix {
         p.mix = match m.to_ascii_lowercase().as_str() {

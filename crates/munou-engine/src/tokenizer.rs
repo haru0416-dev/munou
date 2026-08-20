@@ -337,7 +337,7 @@ mod tests {
         let mut intern = Interner::new();
         let t = tok.tokenize(&mut intern, "hello世界123");
         let morphs: Vec<&str> = t.morphemes.iter().map(|id| intern.get(*id)).collect();
-        assert!(morphs.iter().any(|s| *s == "hello"));
+        assert!(morphs.contains(&"hello"));
         assert!(morphs.iter().any(|s| s.contains('世') || *s == "世"));
     }
 

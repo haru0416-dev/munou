@@ -36,6 +36,7 @@ const BANNED_CRATES: &[&str] = &[
     "tract-core",
     "tungstenite",
     "ureq",
+    "kenlm",
 ];
 
 pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
@@ -503,7 +504,7 @@ fn lockfile_banned() -> std::result::Result<(), String> {
         let Some(name) = rest.strip_suffix('"') else {
             continue;
         };
-        if BANNED_CRATES.iter().any(|b| *b == name) {
+        if BANNED_CRATES.contains(&name) {
             names.push(name.to_string());
         }
     }

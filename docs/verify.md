@@ -8,7 +8,7 @@
 
 ## 結論
 
-v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会話ログから育つ）は満たしている。v0.1.1 で候補は XOR ではなくプール。v0.1.2 でライブ吸収は `p_learn`。v0.1.3 で観察窓が本線（アダプタは劣後）。v0.1.4 で次数補間・Witten-Bell・帯域ヒンジ・Boltzmann slip・連続部分列の丸暗記検出。v0.1.5 で LLM エコシステムの概念だけを閉じた構造へ写す（nucleus・経路ゲート・記憶三層・`/good` `/bad`）。v0.1.6 で閉じた雑談ログを大量複製（`munou scale`）。API も重みも使っていない。設計 §2.2 の速度・常駐メモリは **release 実測で要件内**。mmap コールドスタートとホットパスのヒープゼロは未実装で、検証コマンドでは SKIP としている。
+v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会話ログから育つ）は満たしている。v0.1.1 で候補は XOR ではなくプール。v0.1.2 でライブ吸収は `p_learn`。v0.1.3 で観察窓が本線（アダプタは劣後）。v0.1.4 で次数補間・Witten-Bell・帯域ヒンジ・Boltzmann slip・連続部分列の丸暗記検出。v0.1.5 で LLM エコシステムの概念だけを閉じた構造へ写す（nucleus・経路ゲート・記憶三層・`/good` `/bad`）。v0.1.6 で閉じた雑談ログを大量複製（`munou scale`）。v0.1.7 で modified KN / PPM 除外 / skip-gram / recency cache を SA マルコフへ写す（KenLM は使わない）。API も重みも使っていない。設計 §2.2 の速度・常駐メモリは **release 実測で要件内**。mmap コールドスタートとホットパスのヒープゼロは未実装で、検証コマンドでは SKIP としている。
 
 検証中に直したもの:
 
@@ -22,9 +22,9 @@ v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS（unit 38 + spec 22 + soak 16） |
+| `cargo test --workspace` | PASS（unit 45 + spec 23 + soak 16） |
 
-spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップ、観察窓（空 / シード育ち / 記録中 / path 再開）、meta 好みがコーパスに入らないこと、経路ゲート後もエコーがプールに残ることを固定する。soak は変な入力・壊れた JSONL・パラメータ端・再開後の `/good` `/why`・80ターンのレイテンシを回す。
+spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、skip/cache/PPM フラグ、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップ、観察窓（空 / シード育ち / 記録中 / path 再開）、meta 好みがコーパスに入らないこと、経路ゲート後もエコーがプールに残ることを固定する。soak は変な入力・壊れた JSONL・パラメータ端・再開後の `/good` `/why`・80ターンのレイテンシを回す。
 
 ## 四性質
 
@@ -71,7 +71,7 @@ debug ビルドのトークナイズは ~6MB/s で要件未満、engine-p99 も 
 | intern u32 | `Interner` | PASS |
 | コーパス = u32 列 + SA-IS | `Store.text` + `Store.sa`、バッファ世代マージ | PASS |
 | 可変長 n-gram | SA 二分探索 + 最長一致バックオフ | PASS |
-| 素朴バックオフ既定、KN は trait | `Smoothing`、`--smoothing kn` | PASS |
+| 素朴バックオフ既定、modified KN は trait | `Smoothing`、`--smoothing kn`。KenLM なし | PASS |
 | alias 法 + 温度 | Vose alias、`τ_gen` | PASS |
 | 選択 = embed ランク + p_slip | ハッシュ embed dim 256、2 位以下を加重サンプル | PASS |
 | 話題ベクトル MA | `TopicTracker` k=5 | PASS |

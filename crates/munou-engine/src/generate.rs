@@ -125,25 +125,47 @@ fn dist_with_backoff(
     // previous bug: a long match threw away the intermediate n-grams.
     let mut used = 0usize;
     let mut freq = 0u32;
+    let exclude =
+        params.ppm_exclude || matches!(params.smoothing, crate::params::SmoothingKind::Kn);
     for len in 1..=ctx.len() {
         let sub = &ctx[ctx.len() - len..];
-        let key = sub.to_vec();
-        let (counts, total) = if let Some(hit) = memo.get(&key) {
-            hit.clone()
-        } else {
-            let got = store.next_counts(sub);
-            memo.insert(key, got.clone());
-            got
-        };
+        let (counts, total) = lookup_counts(store, memo, sub);
         if total == 0 {
             continue;
         }
         let n1plus = counts.len() as u32;
-        backoff = smoothing.distribute(&counts, total, n1plus, &backoff);
+        let lower = if exclude {
+            exclude_seen(&backoff, &counts)
+        } else {
+            backoff
+        };
+        backoff = smoothing.distribute(&counts, total, n1plus, &lower);
         if total >= params.f_min || freq < params.f_min {
             used = len;
             freq = total;
         }
+    }
+
+    // Skip-gram + recency cache only when the contiguous suffix is missing or rare.
+    // A solid longest match (the 36/40 continuation test) must not leak into these.
+    let sparse = used < ctx.len() || freq < params.f_min;
+    if sparse && params.lambda_skip > 0.0 && ctx.len() >= 3 {
+        let mut skip = ctx.to_vec();
+        skip.remove(skip.len() - 2);
+        let (counts, total) = lookup_counts(store, memo, &skip);
+        if total > 0 {
+            let extra = counts_to_ml(&counts, total);
+            backoff = mix_lambda(&backoff, &extra, params.lambda_skip);
+        }
+    }
+    if sparse && params.lambda_cache > 0.0 && !ctx.is_empty() {
+        let hist = if ctx.len() > 12 {
+            &ctx[ctx.len() - 12..]
+        } else {
+            ctx
+        };
+        let extra = parrot_unigram(hist);
+        backoff = mix_lambda(&backoff, &extra, params.lambda_cache);
     }
 
     if backoff.is_empty() {
@@ -155,6 +177,86 @@ fn dist_with_backoff(
     let ids: Vec<TokenId> = backoff.iter().map(|(id, _)| *id).collect();
     let w: Vec<f64> = backoff.iter().map(|(_, p)| *p).collect();
     (ids, w, used, freq)
+}
+
+fn lookup_counts(
+    store: &Store,
+    memo: &mut NextMemo,
+    ctx: &[TokenId],
+) -> (Vec<(TokenId, u32)>, u32) {
+    let key = ctx.to_vec();
+    if let Some(hit) = memo.get(&key) {
+        hit.clone()
+    } else {
+        let got = store.next_counts(ctx);
+        memo.insert(key, got.clone());
+        got
+    }
+}
+
+/// PPM-C: types already seen at this order are removed from the backoff and
+/// the leftover is renormalised. Interpolation (short→long) stays; only the
+/// lower-order support is trimmed.
+fn exclude_seen(backoff: &[(TokenId, f64)], local: &[(TokenId, u32)]) -> Vec<(TokenId, f64)> {
+    let seen: rustc_hash::FxHashSet<TokenId> = local.iter().map(|(id, _)| *id).collect();
+    let mut out: Vec<(TokenId, f64)> = backoff
+        .iter()
+        .copied()
+        .filter(|(id, p)| *p > 0.0 && !seen.contains(id))
+        .collect();
+    let z: f64 = out.iter().map(|(_, p)| *p).sum();
+    if z > 0.0 {
+        for (_, p) in out.iter_mut() {
+            *p /= z;
+        }
+    }
+    out
+}
+
+fn counts_to_ml(counts: &[(TokenId, u32)], total: u32) -> Vec<(TokenId, f64)> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let t = total as f64;
+    counts.iter().map(|(id, c)| (*id, *c as f64 / t)).collect()
+}
+
+fn mix_lambda(base: &[(TokenId, f64)], extra: &[(TokenId, f64)], lam: f64) -> Vec<(TokenId, f64)> {
+    let lam = lam.clamp(0.0, 1.0);
+    if lam <= 0.0 || extra.is_empty() {
+        return base.to_vec();
+    }
+    let keep = 1.0 - lam;
+    let mut map: FxHashMap<TokenId, f64> = FxHashMap::default();
+    let mut order: Vec<TokenId> = Vec::new();
+    for &(id, p) in base {
+        if keep > 0.0 {
+            if !map.contains_key(&id) {
+                order.push(id);
+            }
+            *map.entry(id).or_insert(0.0) += keep * p;
+        }
+    }
+    for &(id, p) in extra {
+        if !map.contains_key(&id) {
+            order.push(id);
+        }
+        *map.entry(id).or_insert(0.0) += lam * p;
+    }
+    let mut out: Vec<(TokenId, f64)> = order
+        .into_iter()
+        .filter_map(|id| {
+            let p = map.get(&id).copied().unwrap_or(0.0);
+            (p > 0.0).then_some((id, p))
+        })
+        .collect();
+    let z: f64 = out.iter().map(|(_, p)| *p).sum();
+    if z > 0.0 {
+        for (_, p) in out.iter_mut() {
+            *p /= z;
+        }
+    }
+    out
 }
 
 fn parrot_unigram(parrot: &[TokenId]) -> Vec<(TokenId, f64)> {
@@ -318,5 +420,82 @@ mod tests {
             hit_x >= 8,
             "interpolated P(x|b,a) should leak from P(x|a); hit_x={hit_x}/200"
         );
+    }
+
+    #[test]
+    fn skip_gram_uses_gapped_context() {
+        let mut store = Store::new(32);
+        let (a, b, c, want, z) = (20u32, 21, 22, 23, 24);
+        for _ in 0..50 {
+            store.push_utterance(&[c, z]);
+        }
+        for _ in 0..8 {
+            store.push_utterance(&[a, c, want]);
+        }
+        store.merge();
+        let params = Params {
+            f_min: 3,
+            l_max: 8,
+            max_gen_len: 1,
+            tau_gen: 1.0,
+            lambda_skip: 1.0,
+            lambda_cache: 0.0,
+            ..Params::default()
+        };
+        let smoothing = NaiveBackoff;
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut hit = 0;
+        for _ in 0..40 {
+            let g = generate_one(&store, &smoothing, &params, &[a, b, c], &[], &mut rng);
+            if g.tokens.first() == Some(&want) {
+                hit += 1;
+            }
+        }
+        assert!(
+            hit >= 36,
+            "skip-gram [a,c] should dominate when [a,b,c] is missing; hit={hit}/40"
+        );
+    }
+
+    #[test]
+    fn cache_boosts_recent_history_when_context_unknown() {
+        let mut store = Store::new(32);
+        let (a, z) = (20u32, 24);
+        for _ in 0..40 {
+            store.push_utterance(&[z, z]);
+        }
+        store.merge();
+        let params = Params {
+            f_min: 3,
+            l_max: 8,
+            max_gen_len: 1,
+            tau_gen: 1.0,
+            lambda_skip: 0.0,
+            lambda_cache: 1.0,
+            ..Params::default()
+        };
+        let smoothing = NaiveBackoff;
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let mut hit = 0;
+        for _ in 0..40 {
+            let g = generate_one(&store, &smoothing, &params, &[a, a, a], &[], &mut rng);
+            if g.tokens.first() == Some(&a) {
+                hit += 1;
+            }
+        }
+        assert!(
+            hit >= 36,
+            "recency cache should emit the in-context token when suffixes miss; hit={hit}/40"
+        );
+    }
+
+    #[test]
+    fn ppm_exclusion_drops_seen_types_from_backoff() {
+        let back = vec![(1, 0.4), (2, 0.6)];
+        let local = vec![(1, 5)];
+        let out = exclude_seen(&back, &local);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 2);
+        assert!((out[0].1 - 1.0).abs() < 1e-9);
     }
 }
