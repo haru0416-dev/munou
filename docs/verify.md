@@ -14,7 +14,7 @@ v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会
 
 - マルコフ文脈に **現在のユーザーチャンクが入っていなかった**（履歴だけを渡していた）
 - トークナイズが形態素/チャンクの `String` を二重に保持して **debug で 50MB/s を大幅に下回った**。スライス intern に変更
-- CI の `dtolnay/rust-toolchain@1.83.0` が解決できない。`@master` + `toolchain: 1.83.0` に変更
+- CI の dtolnay/rust-toolchain actionで `@1.83.0` が解決できない。`@master` + `toolchain: 1.83.0` に変更
 
 ## 自動テスト
 
@@ -449,3 +449,9 @@ SKIP         … v0.1 でやらないと決めた項目、または debug では
 ```
 
 `--sa-tokens` が 10^7 未満だと `rss-1e7` は SKIP。CI は `verify --sa-tokens 20000 --turns 40` と `probe --seed data/seed.jsonl`。verify は `observe-empty` / `observe-logged` / `observe-seed` を含む。
+
+## 再開時の乱数位置修正（2026-08-20）
+
+`Engine::open` が毎回 ChaCha8 の位置0から始めていたため、1ターン後の live engine は word offset 6、同じログを reopen した engine は0になっていた。既存の決定性テストは2台を同時に先頭から進めるだけで、この再開差を見ていなかった。
+
+bot レコードへ応答後の `rng_word_pos`（68-bit offsetをu64 2語に分割）を追加し、open時に最後の保存位置へ seek するようにした。回帰テストは fabricate 64組の同一ログから live/reopen を分岐し、次ターンの本文・合いの手・path・learn roll の一致を確認する。旧レコードはフィールド省略を受理し、最初の新形式ターン以後に位置が保存される。

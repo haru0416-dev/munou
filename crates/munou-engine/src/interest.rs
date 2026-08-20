@@ -94,7 +94,6 @@ impl InterestLedger {
             .map(|(id, _)| *id)
             .collect()
     }
-
 }
 
 #[cfg(test)]
@@ -135,7 +134,10 @@ mod tests {
     fn repeats_inside_one_utterance_count_once() {
         let mut a = InterestLedger::default();
         a.learn(&[70, 70, 70], no_punct);
-        assert!(a.is_hearsay(70, 2), "そうそうそう must not fast-track a word");
+        assert!(
+            a.is_hearsay(70, 2),
+            "そうそうそう must not fast-track a word"
+        );
     }
 
     #[test]

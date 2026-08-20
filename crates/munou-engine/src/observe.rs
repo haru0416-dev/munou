@@ -109,8 +109,8 @@ impl LogDigest {
             self.first_speech_t = Some(rec.t);
         }
         if let Some(prev) = self.last_speech_t {
-            let gap = crate::weather::day_of_ms(rec.t)
-                .saturating_sub(crate::weather::day_of_ms(prev));
+            let gap =
+                crate::weather::day_of_ms(rec.t).saturating_sub(crate::weather::day_of_ms(prev));
             if gap >= crate::milestone::ALOOF_GAP_DAYS {
                 self.aloof_left = crate::milestone::ALOOF_SPEECH;
                 self.last_gap_days = gap;
@@ -697,6 +697,7 @@ mod tests {
             path: Some(PathKind::Echo),
             novelty_lcs: None,
             n_tok: None,
+            rng_word_pos: None,
         };
         let o = Observe::from_parts(
             &st,

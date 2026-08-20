@@ -33,7 +33,9 @@ impl InterjectBank {
         if n == 0 || n > MAX_CHARS {
             return;
         }
-        if t.chars().all(|c| !c.is_alphanumeric() && !is_kana_or_cjk(c)) {
+        if t.chars()
+            .all(|c| !c.is_alphanumeric() && !is_kana_or_cjk(c))
+        {
             return; // punctuation-only lines are excluded
         }
         match self.index.get(t) {
@@ -91,7 +93,13 @@ mod tests {
     #[test]
     fn harvests_short_lines_with_counts() {
         let mut b = InterjectBank::default();
-        for t in ["はい", "はい", "うん", "そうだね", "今日はとてもいい天気ですね"] {
+        for t in [
+            "はい",
+            "はい",
+            "うん",
+            "そうだね",
+            "今日はとてもいい天気ですね",
+        ] {
             b.learn(t);
         }
         assert_eq!(b.distinct(), 3, "long line must be ignored");

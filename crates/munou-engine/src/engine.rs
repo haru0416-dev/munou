@@ -13,14 +13,13 @@ use crate::eval::EvalAccum;
 use crate::explain::{GenStep, PathKind, Trace};
 use crate::generate::{generate_one, GenCaches, Generated};
 use crate::ids::{is_special, TokenId};
-use crate::intern::Interner;
 use crate::interest::InterestLedger;
 use crate::interject::InterjectBank;
+use crate::intern::Interner;
 use crate::log::{AppendLog, Record, Role};
 use crate::milestone;
 use crate::mix::Pool;
 use crate::observe::{LogDigest, Observe};
-use crate::weather;
 use crate::params::{MixMode, Params, SmoothingKind};
 use crate::retrieve::BotStore;
 use crate::route;
@@ -29,6 +28,7 @@ use crate::smoothing::{self, Smoothing};
 use crate::store::Store;
 use crate::tokenizer::{detokenize, Tokenized, Tokenizer};
 use crate::trigger::TriggerDict;
+use crate::weather;
 
 #[derive(Default)]
 pub struct OpenConfig {
@@ -181,6 +181,16 @@ impl Engine {
 
         let mut smoothing = smoothing::boxed(cfg.params.smoothing, cfg.params.kn_discount);
         smoothing::sync_to_store(smoothing.as_mut(), &cfg.params, &store);
+        let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
+        if let Some(pos) = log
+            .records
+            .iter()
+            .rev()
+            .find(|rec| rec.role == Role::Bot)
+            .and_then(Record::saved_rng_word_pos)
+        {
+            rng.set_word_pos(pos);
+        }
         Ok(Self {
             intern,
             tokenizer,
@@ -188,7 +198,7 @@ impl Engine {
             embedder,
             topic,
             triggers,
-            rng: ChaCha8Rng::seed_from_u64(cfg.seed),
+            rng,
             seed: cfg.seed,
             params: cfg.params,
             log,
@@ -413,7 +423,7 @@ impl Engine {
         let learned_user = learned && !tok.chunks.is_empty();
         let learned_bot = learned && !chosen_tokens.is_empty();
         let rec_user = Record::user(input.to_string(), learned_user);
-        let rec_bot = Record::bot(
+        let mut rec_bot = Record::bot(
             chosen_text.clone(),
             learned_bot,
             sim,
@@ -422,6 +432,7 @@ impl Engine {
             novelty_lcs,
             chosen_tokens.len(),
         );
+        rec_bot.set_rng_word_pos(self.rng.get_word_pos());
         // Append first: the log is the source of truth, and digest/eval must
         // not advance when the write fails. 節目 is a digest crossing, so the
         // pre-append values are captured here.
@@ -959,10 +970,7 @@ impl Engine {
         });
         tops.truncate(5);
         if !tops.is_empty() {
-            let line: Vec<String> = tops
-                .iter()
-                .map(|(w, sc)| format!("{w}({sc:.2})"))
-                .collect();
+            let line: Vec<String> = tops.iter().map(|(w, sc)| format!("{w}({sc:.2})")).collect();
             out.push_str(&format!("関心        {}\n", line.join(" ")));
         }
         out
@@ -996,6 +1004,7 @@ impl Engine {
         let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
         self.store.warm_sampling(kn);
         let uni = self.store.sampling_view(kn).expect("warmed above");
+        let mut rng = self.rng.clone();
         generate_one(
             &self.store,
             self.smoothing.as_ref(),
@@ -1004,7 +1013,7 @@ impl Engine {
             &parrot,
             uni,
             &mut self.gen_caches,
-            &mut self.rng,
+            &mut rng,
         )
         .tokens
         .len()
@@ -1332,6 +1341,113 @@ mod tests {
         })
         .unwrap();
         assert!(e2.stats().utterances >= 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rng_position_matches_after_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "munou-rng-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        crate::fabricate::write_jsonl(
+            &log,
+            crate::fabricate::FabricateOpts {
+                pairs: 64,
+                rng_seed: 1,
+                unique_frac: 0.0,
+            },
+        )
+        .unwrap();
+        let params = Params {
+            p_learn: 0.0,
+            p_slip: 0.0,
+            weather: false,
+            interject_rate: 0.0,
+            ..Params::default()
+        };
+        let mut live = Engine::open(OpenConfig {
+            params: params.clone(),
+            seed: 1,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        live.respond("こんにちは").unwrap();
+        let live_pos = live.rng.get_word_pos();
+        let resumed_log = dir.join("resumed.jsonl");
+        std::fs::copy(&log, &resumed_log).unwrap();
+        let mut reopened = Engine::open(OpenConfig {
+            params,
+            seed: 1,
+            log_path: Some(resumed_log),
+            triggers_path: None,
+        })
+        .unwrap();
+        assert_eq!(reopened.rng.get_word_pos(), live_pos);
+        let live_reply = live.respond("散歩しない？").unwrap();
+        let reopened_reply = reopened.respond("散歩しない？").unwrap();
+        assert_eq!(reopened_reply.text, live_reply.text);
+        assert_eq!(reopened_reply.interject, live_reply.interject);
+        assert_eq!(reopened_reply.trace.path, live_reply.trace.path);
+        assert_eq!(reopened_reply.trace.learn_roll, live_reply.trace.learn_roll);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markov_draw_does_not_advance_conversation_rng() {
+        let mut e = Engine::ephemeral(Params::default(), 1).unwrap();
+        e.respond("こんにちは").unwrap();
+        let before = e.rng.get_word_pos();
+        let _ = e.markov_draw();
+        assert_eq!(e.rng.get_word_pos(), before);
+    }
+
+    #[test]
+    fn latest_legacy_bot_does_not_reuse_stale_rng_position() {
+        let dir = std::env::temp_dir().join(format!(
+            "munou-rng-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        {
+            let mut e = Engine::open(OpenConfig {
+                params: Params::default(),
+                seed: 1,
+                log_path: Some(log.clone()),
+                triggers_path: None,
+            })
+            .unwrap();
+            e.respond("こんにちは").unwrap();
+        }
+        {
+            let mut append = AppendLog::open(Some(&log)).unwrap();
+            append
+                .append_turn(
+                    Record::user("legacy user".into(), false),
+                    Record::bot("legacy bot".into(), false, 0.0, false, PathKind::Echo, 0, 1),
+                )
+                .unwrap();
+        }
+        let reopened = Engine::open(OpenConfig {
+            params: Params::default(),
+            seed: 1,
+            log_path: Some(log),
+            triggers_path: None,
+        })
+        .unwrap();
+        assert_eq!(reopened.rng.get_word_pos(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1704,7 +1820,10 @@ mod tests {
                 fired = true;
             }
         }
-        assert!(fired, "rate=1 with a live bank must produce an interjection");
+        assert!(
+            fired,
+            "rate=1 with a live bank must produce an interjection"
+        );
     }
 
     /// 節目 fires exactly on the crossing turn and never again.

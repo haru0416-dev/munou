@@ -63,8 +63,16 @@ pub(crate) fn lines(
 /// Achieved marks for あゆみ: (learned marks reached, day marks reached).
 pub(crate) fn achieved(learned: usize, age_days: u64) -> (Vec<usize>, Vec<u64>) {
     (
-        LEARNED_MARKS.iter().copied().filter(|m| learned >= *m).collect(),
-        DAY_MARKS.iter().copied().filter(|m| age_days >= *m).collect(),
+        LEARNED_MARKS
+            .iter()
+            .copied()
+            .filter(|m| learned >= *m)
+            .collect(),
+        DAY_MARKS
+            .iter()
+            .copied()
+            .filter(|m| age_days >= *m)
+            .collect(),
     )
 }
 
@@ -85,6 +93,7 @@ mod tests {
             path: None,
             novelty_lcs: None,
             n_tok: None,
+            rng_word_pos: None,
         }
     }
 

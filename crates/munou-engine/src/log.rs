@@ -39,6 +39,10 @@ pub struct Record {
     /// Chosen candidate length in tokens (for rote reconstruction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_tok: Option<usize>,
+    /// ChaCha position after this reply, split into low/high words so the
+    /// full 68-bit stream offset round-trips through ordinary JSON numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rng_word_pos: Option<[u64; 2]>,
 }
 
 fn default_learned() -> bool {
@@ -58,6 +62,7 @@ impl Record {
             path: None,
             novelty_lcs: None,
             n_tok: None,
+            rng_word_pos: None,
         }
     }
 
@@ -82,6 +87,7 @@ impl Record {
             path: Some(path),
             novelty_lcs: Some(novelty_lcs),
             n_tok: Some(n_tok),
+            rng_word_pos: None,
         }
     }
 
@@ -98,7 +104,17 @@ impl Record {
             path,
             novelty_lcs: None,
             n_tok: None,
+            rng_word_pos: None,
         }
+    }
+
+    pub(crate) fn set_rng_word_pos(&mut self, pos: u128) {
+        self.rng_word_pos = Some([pos as u64, (pos >> 64) as u64]);
+    }
+
+    pub(crate) fn saved_rng_word_pos(&self) -> Option<u128> {
+        self.rng_word_pos
+            .map(|[lo, hi]| u128::from(lo) | (u128::from(hi) << 64))
     }
 }
 
@@ -168,8 +184,9 @@ impl AppendLog {
     }
 
     /// Append a user/bot turn as two records with one write and one fsync.
-    /// File contents are identical to two `append` calls; the turn becomes
-    /// atomic on disk and the respond path pays half the sync cost.
+    /// File contents are identical to two `append` calls and the respond path
+    /// pays half the sync cost. JSONL does not make the two records atomic
+    /// against a torn write; recovery only accepts complete lines.
     pub fn append_turn(&mut self, a: Record, b: Record) -> Result<()> {
         if let Some(f) = self.file.as_mut() {
             let mut lines = serde_json::to_string(&a)?;

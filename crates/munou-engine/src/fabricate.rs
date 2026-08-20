@@ -127,6 +127,7 @@ fn rec(t: u64, role: Role, text: String) -> Record {
         path: None,
         novelty_lcs: None,
         n_tok: None,
+        rng_word_pos: None,
     }
 }
 
