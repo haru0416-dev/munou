@@ -41,9 +41,11 @@ cargo run -p munou-cli --release -- bench --tokens 10000000
 
 cargo run -p munou-cli --release -- verify --sa-tokens 10000000 --turns 300
 cargo run -p munou-cli --release -- probe --seed data/seed.jsonl
+cargo run -p munou-cli --release -- scale --pairs 10000
+cargo run -p munou-cli --release -- fabricate --pairs 50000 --out munou-data/grown.jsonl
 ```
 
-`probe` は `data/seed.jsonl`（25往復の雑談ログ）を読み、空エンジンと育てたエンジンで同じ入力を投げて数値を出す。
+`probe` は `data/seed.jsonl`（25往復の雑談ログ）を読み、空エンジンと育てたエンジンで同じ入力を投げて数値を出す。巨大ログは Wikipedia ではなく、同じ雑談型の組み合わせ（`fabricate` / `scale`）。`data/seed.jsonl` の 50 件はそのまま。
 
 設計書との突き合わせは [`docs/verify.md`](docs/verify.md)。
 

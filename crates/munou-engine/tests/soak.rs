@@ -7,7 +7,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use munou_engine::{
-    Engine, MixMode, OpenConfig, Params, PathKind, SmoothingKind, Stage, TriggerDict,
+    fabricate_write, Engine, FabricateOpts, MixMode, OpenConfig, Params, PathKind, SmoothingKind,
+    Stage, TriggerDict,
 };
 
 fn tmp(tag: &str) -> PathBuf {
@@ -500,5 +501,43 @@ fn inf_jsonl_score_does_not_poison_eval() {
     let e = open_log(&dir, Params::default(), 1);
     let s = e.eval_summary();
     assert!(!s.to_lowercase().contains("nan"), "{s}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fabricated_thousands_are_dense_and_closed() {
+    let dir = tmp("fab");
+    let log = dir.join("log.jsonl");
+    let n = fabricate_write(
+        &log,
+        FabricateOpts {
+            pairs: 400,
+            rng_seed: 1,
+            unique_frac: 0.0,
+        },
+    )
+    .unwrap();
+    assert_eq!(n, 800);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut e = Engine::open(OpenConfig {
+        params: Params {
+            p_slip: 0.0,
+            ..Params::default()
+        },
+        seed: 1,
+        log_path: Some(log),
+        triggers_path: Some(root.join("data/triggers.example.json")),
+    })
+    .unwrap();
+    let st = e.stats();
+    assert_eq!(st.utterances, 800);
+    assert_eq!(st.learned, 800);
+    assert!(st.tokens >= 400, "tokens={}", st.tokens);
+    assert_eq!(e.observe().stage, Stage::Dense);
+    let hi = e.respond("おはよう").unwrap();
+    assert_eq!(hi.trace.path, PathKind::Trigger);
+    let ood = e.respond("量子力学の話をしよう").unwrap();
+    assert_ne!(ood.trace.path, PathKind::Trigger);
+    assert!(e.observe().panel().contains("濃い"));
     let _ = fs::remove_dir_all(&dir);
 }
