@@ -1,10 +1,15 @@
-//! Candidate ranking by topic cosine, source priors, and anti-parrot LCS.
+//! Candidate ranking: topic cosine + source priors − contiguous rote − band hinge.
+//!
+//! Maximising cosine alone fights the design's band objective (§6). In-band
+//! candidates keep their cosine order; a hinge penalises sim < lo or sim > hi.
+//! Slip samples 2nd+ with a Boltzmann distribution (entropy-regularised argmax).
 
 use rand::Rng;
 
+use crate::alias::AliasTable;
 use crate::embed::{cosine, Embedder};
 use crate::explain::{CandidateTrace, PathKind};
-use crate::generate::lcs_len;
+use crate::generate::lcsubstr_len;
 use crate::ids::TokenId;
 use crate::params::Params;
 
@@ -35,6 +40,17 @@ pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32
     }
 }
 
+/// Hinge loss against the similarity band. Zero inside `[lo, hi]`.
+pub fn band_hinge(sim: f32, lo: f32, hi: f32) -> f32 {
+    if sim > hi {
+        sim - hi
+    } else if sim < lo {
+        lo - sim
+    } else {
+        0.0
+    }
+}
+
 pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
     embedder: &E,
     input: RankInput<'_>,
@@ -50,8 +66,10 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
         let source = input.sources.get(i).copied().unwrap_or(PathKind::Markov);
         let toks = input.tokens.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
         let denom = toks.len().max(1) as f32;
-        let rote = params.rote_penalty * (lcs_len(toks, input.input_tokens) as f32 / denom);
-        let score = topic_s + source_bias(source, params, input.trigger_match) - rote;
+        let rote = params.rote_penalty * (lcsubstr_len(toks, input.input_tokens) as f32 / denom);
+        let score = topic_s + source_bias(source, params, input.trigger_match)
+            - rote
+            - params.band_penalty * band_hinge(topic_s, params.band_lo, params.band_hi);
         scored.push((i, score, topic_s));
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -59,19 +77,8 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
     let slip_roll: f64 = rng.gen();
     let slipped = slip_roll < params.p_slip && scored.len() >= 2;
     let chosen_rank = if slipped {
-        let rest = &scored[1..];
-        let mut w: Vec<f64> = rest
-            .iter()
-            .map(|(_, s, _)| (*s as f64 + 1.0).max(1e-6))
-            .collect();
-        let z: f64 = w.iter().sum();
-        if z > 0.0 {
-            for x in w.iter_mut() {
-                *x /= z;
-            }
-        }
-        let table = crate::alias::AliasTable::from_weights(&w);
-        1 + table.sample(rng)
+        let rest: Vec<f64> = scored[1..].iter().map(|(_, s, _)| *s as f64).collect();
+        1 + AliasTable::softmax_sample(&rest, params.tau_slip, rng)
     } else {
         0
     };
@@ -167,5 +174,12 @@ mod tests {
             r.traces.iter().find(|c| c.chosen).unwrap().source,
             PathKind::Trigger
         );
+    }
+
+    #[test]
+    fn band_hinge_zero_inside_and_positive_outside() {
+        assert_eq!(band_hinge(0.5, 0.25, 0.85), 0.0);
+        assert!((band_hinge(1.0, 0.25, 0.85) - 0.15).abs() < 1e-6);
+        assert!((band_hinge(0.0, 0.25, 0.85) - 0.25).abs() < 1e-6);
     }
 }

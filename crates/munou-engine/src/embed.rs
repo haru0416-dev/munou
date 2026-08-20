@@ -38,11 +38,14 @@ impl Embedder for HashEmbedder {
             return;
         }
         for n in 1..=4.min(chars.len()) {
-            for w in chars.windows(n) {
-                let h = fnv1a_chars(w);
+            // Longer n-grams are more specific; unigrams would otherwise dominate
+            // because there are more of them. Weight ∝ n, then L2-normalise.
+            let w = n as f32;
+            for window in chars.windows(n) {
+                let h = fnv1a_chars(window);
                 let sign = if h & 1 == 0 { 1.0f32 } else { -1.0 };
                 let bin = ((h >> 1) as usize) % d;
-                out[bin] += sign;
+                out[bin] += sign * w;
             }
         }
         l2_normalize(&mut out[..d]);

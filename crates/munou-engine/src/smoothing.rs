@@ -17,9 +17,9 @@ pub trait Smoothing: Send + Sync {
     ) -> Vec<(TokenId, f64)>;
 }
 
-/// Maximum-likelihood with interpolation against the backoff distribution
-/// when the context is sparse. The engine still shortens the context when
-/// `total < f_min`; this layer only shapes the weights at a given order.
+/// Maximum-likelihood with Witten-Bell interpolation against the backoff
+/// distribution. `λ = N/(N+T)` where T is the number of unique continuations.
+/// The engine interpolates every order; this layer only shapes one order.
 pub struct NaiveBackoff;
 
 impl Smoothing for NaiveBackoff {
@@ -31,13 +31,16 @@ impl Smoothing for NaiveBackoff {
         &self,
         local: &[(TokenId, u32)],
         total: u32,
-        _n1plus: u32,
+        n1plus: u32,
         backoff: &[(TokenId, f64)],
     ) -> Vec<(TokenId, f64)> {
         if total == 0 {
             return backoff.to_vec();
         }
-        let lambda = total as f64 / (total as f64 + 1.0);
+        let n = total as f64;
+        let t = n1plus.max(1) as f64;
+        // Witten-Bell: λ = N/(N+T). More unique continuations → more backoff.
+        let lambda = n / (n + t);
         mix(local, total, lambda, backoff)
     }
 }
@@ -146,5 +149,24 @@ mod tests {
         let z: f64 = out.iter().map(|(_, p)| *p).sum();
         assert!((z - 1.0).abs() < 1e-9);
         assert!(out.iter().any(|(id, _)| *id == 3));
+    }
+
+    #[test]
+    fn witten_bell_backs_off_more_when_types_grow() {
+        let back = vec![(1, 0.5), (4, 0.5)];
+        let few = NaiveBackoff.distribute(&[(1, 10)], 10, 1, &back);
+        let many = NaiveBackoff.distribute(&[(1, 6), (2, 2), (3, 2)], 10, 3, &back);
+        let p4 = |d: &[(TokenId, f64)]| {
+            d.iter()
+                .find(|(id, _)| *id == 4)
+                .map(|(_, p)| *p)
+                .unwrap_or(0.0)
+        };
+        assert!(
+            p4(&many) > p4(&few),
+            "T=3 should put more mass on unseen-in-context token than T=1; few={} many={}",
+            p4(&few),
+            p4(&many)
+        );
     }
 }

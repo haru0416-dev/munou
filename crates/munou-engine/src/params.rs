@@ -32,9 +32,13 @@ pub struct Params {
     pub chunk_morphs: usize,
     /// Embedding dimension for the closed hash embedder.
     pub embed_dim: usize,
-    /// Similarity band `[a, b]` used by the eval metric (not the selector).
+    /// Similarity band `[a, b]`. Eval metric and selector hinge.
     pub band_lo: f32,
     pub band_hi: f32,
+    /// Hinge weight for sim outside the band. 0 restores pure cosine max.
+    pub band_penalty: f32,
+    /// Boltzmann temperature for p_slip sampling of ranks ≥ 2.
+    pub tau_slip: f64,
     /// Smoothing: `"naive"` or `"kn"`.
     pub smoothing: SmoothingKind,
     /// Absolute discount for Kneser-Ney.
@@ -47,7 +51,7 @@ pub struct Params {
     pub n_echo: usize,
     /// Subtracted from topic cosine when the source is Echo.
     pub echo_penalty: f32,
-    /// Subtracted × (token LCS with the *input* / candidate length). Anti-parrot.
+    /// Subtracted × (token longest-common-substring with the *input* / len).
     pub rote_penalty: f32,
     /// Added to topic cosine when the source is Trigger.
     pub trigger_bonus: f32,
@@ -55,6 +59,8 @@ pub struct Params {
     pub trigger_match_weight: f32,
     /// Subtracted when the source is Retrieve (slightly prefer recombination).
     pub retrieve_penalty: f32,
+    /// MMR λ for retrieve: λ·sim − (1−λ)·max redundancy. 1 = top-k cosine.
+    pub mmr_lambda: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +99,8 @@ impl Default for Params {
             embed_dim: 256,
             band_lo: 0.25,
             band_hi: 0.85,
+            band_penalty: 0.5,
+            tau_slip: 0.45,
             smoothing: SmoothingKind::Naive,
             kn_discount: 0.75,
             mix: MixMode::Pool,
@@ -103,6 +111,7 @@ impl Default for Params {
             trigger_bonus: 0.10,
             trigger_match_weight: 1.0,
             retrieve_penalty: 0.20,
+            mmr_lambda: 0.75,
         }
     }
 }

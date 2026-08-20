@@ -10,7 +10,7 @@ use crate::embed::{cosine, Embedder, HashEmbedder, TopicTracker};
 use crate::error::Result;
 use crate::eval::EvalAccum;
 use crate::explain::{PathKind, Trace};
-use crate::generate::{generate_one, lcs_len};
+use crate::generate::{generate_one, lcsubstr_len};
 use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
 use crate::log::{now_ms, AppendLog, Record, Role};
@@ -240,7 +240,7 @@ impl Engine {
         let novelty_lcs = self
             .prior
             .iter()
-            .map(|u| lcs_len(&chosen_tokens, u))
+            .map(|u| lcsubstr_len(&chosen_tokens, u))
             .max()
             .unwrap_or(0);
         let chosen_rank = ranked
@@ -403,27 +403,46 @@ impl Engine {
         if self.bots.is_empty() || self.params.n_retrieve == 0 {
             return;
         }
-        let mut buf = vec![0.0f32; self.embedder.dim()];
-        let mut scored: Vec<(f32, usize)> = Vec::with_capacity(self.bots.len());
+        let dim = self.embedder.dim();
+        let lambda = self.params.mmr_lambda.clamp(0.0, 1.0);
+        let mut cands: Vec<(f32, usize, Vec<f32>)> = Vec::with_capacity(self.bots.len());
+        let mut buf = vec![0.0f32; dim];
         for (i, (text, _)) in self.bots.iter().enumerate() {
             if text == input {
                 continue;
             }
             self.embedder.embed(text, &mut buf);
-            scored.push((cosine(topic, &buf), i));
+            let sim = cosine(topic, &buf);
+            cands.push((sim, i, buf.clone()));
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut n = 0usize;
-        for (_, i) in scored {
-            if n >= self.params.n_retrieve {
+        let mut picked: Vec<usize> = Vec::new();
+        while picked.len() < self.params.n_retrieve && picked.len() < cands.len() {
+            let mut best_i = None;
+            let mut best_s = f32::NEG_INFINITY;
+            for (i, (sim, bot_i, emb)) in cands.iter().enumerate() {
+                if picked.contains(&i) {
+                    continue;
+                }
+                if pool.items.iter().any(|p| p.text == self.bots[*bot_i].0) {
+                    continue;
+                }
+                let red = picked
+                    .iter()
+                    .map(|&j| cosine(emb, &cands[j].2))
+                    .fold(0.0f32, f32::max);
+                let mmr = lambda * *sim - (1.0 - lambda) * red;
+                if mmr > best_s {
+                    best_s = mmr;
+                    best_i = Some(i);
+                }
+            }
+            let Some(i) = best_i else {
                 break;
-            }
-            let (text, toks) = self.bots[i].clone();
-            let before = pool.items.len();
+            };
+            picked.push(i);
+            let bot_i = cands[i].1;
+            let (text, toks) = self.bots[bot_i].clone();
             pool.push(PathKind::Retrieve, text, toks);
-            if pool.items.len() > before {
-                n += 1;
-            }
         }
     }
 

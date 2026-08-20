@@ -1,7 +1,7 @@
 //! Unsupervised Japanese-oriented tokenizer.
 //!
 //! Two layers:
-//! 1. **Morphemes** — Unicode script runs, then branching-entropy / accessor-variety
+//! 1. **Morphemes** — Unicode script runs, then **bidirectional** branching-entropy
 //!    cuts inside CJK runs (no dictionary, no labelled data).
 //! 2. **Statistical chunks** — adjacent morphemes grouped into Markov units.
 //!    We do not insist on bunsetsu; chunks exist to keep Markov slightly grammatical.
@@ -66,6 +66,7 @@ struct NextStats {
 #[derive(Debug, Clone, Default)]
 pub struct EntropyModel {
     fwd: FxHashMap<Box<[u32]>, NextStats>,
+    bwd: FxHashMap<Box<[u32]>, NextStats>,
     max_n: usize,
     total_chars: u64,
 }
@@ -74,6 +75,7 @@ impl EntropyModel {
     pub fn new(max_n: usize) -> Self {
         Self {
             fwd: FxHashMap::default(),
+            bwd: FxHashMap::default(),
             max_n: max_n.max(2),
             total_chars: 0,
         }
@@ -88,6 +90,11 @@ impl EntropyModel {
             }
             for i in 0..=chars.len() - n {
                 let key: Box<[u32]> = chars[i..i + n].into();
+                if i > 0 {
+                    let be = self.bwd.entry(key.clone()).or_default();
+                    be.count = be.count.saturating_add(1);
+                    *be.next.entry(chars[i - 1]).or_insert(0) += 1;
+                }
                 let e = self.fwd.entry(key).or_default();
                 e.count = e.count.saturating_add(1);
                 if i + n < chars.len() {
@@ -108,21 +115,30 @@ impl EntropyModel {
         entropy(&st.next)
     }
 
-    fn accessor_variety(&self, gram: &[u32]) -> f64 {
-        let Some(st) = self.fwd.get(gram) else {
+    fn left_entropy(&self, gram: &[u32]) -> f64 {
+        let Some(st) = self.bwd.get(gram) else {
             return 0.0;
         };
-        (st.next.len() as f64).max(1.0).ln()
+        entropy(&st.next)
     }
 
     fn cut_score(&self, chars: &[u32], i: usize) -> f64 {
         // boundary *after* index i (between i and i+1)
-        let n = self.max_n.min(i + 1);
-        if n == 0 {
-            return 0.0;
-        }
-        let gram = &chars[i + 1 - n..=i];
-        0.5 * self.right_entropy(gram) + 0.5 * self.accessor_variety(gram)
+        let n = self.max_n;
+        let left_n = n.min(i + 1);
+        let hr = if left_n == 0 {
+            0.0
+        } else {
+            self.right_entropy(&chars[i + 1 - left_n..=i])
+        };
+        let rest = chars.len().saturating_sub(i + 1);
+        let right_n = n.min(rest);
+        let hl = if right_n == 0 {
+            0.0
+        } else {
+            self.left_entropy(&chars[i + 1..i + 1 + right_n])
+        };
+        0.5 * hr + 0.5 * hl
     }
 }
 
