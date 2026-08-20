@@ -289,7 +289,7 @@ impl Engine {
             slipped: ranked.slipped,
             slip_roll: ranked.slip_roll,
             p_slip: self.params.p_slip,
-            learned,
+            learned: learned && !(tok.chunks.is_empty() && chosen_tokens.is_empty()),
             learn_roll,
             p_learn: self.params.p_learn,
             steps,
@@ -301,30 +301,43 @@ impl Engine {
             path_prior: self.path_prior,
         };
 
-        self.eval.observe(&trace, chosen_tokens.len());
-        let rec_user = Record::user(input.to_string(), learned);
+        // Per-side learned flags: an empty chunk list absorbs nothing live,
+        // so the record must not claim absorption either — otherwise replay
+        // re-tokenises the text (e.g. the ellipsis fallback) into a corpus
+        // the live process never had.
+        let learned_user = learned && !tok.chunks.is_empty();
+        let learned_bot = learned && !chosen_tokens.is_empty();
+        let rec_user = Record::user(input.to_string(), learned_user);
         let rec_bot = Record::bot(
             chosen_text.clone(),
-            learned,
+            learned_bot,
             sim,
             ranked.slipped,
             path,
             novelty_lcs,
             chosen_tokens.len(),
         );
-        self.digest.ingest(&rec_user);
-        self.digest.ingest(&rec_bot);
+        // Append first: the log is the source of truth, and digest/eval must
+        // not advance when the write fails.
         self.log.append_turn(rec_user, rec_bot)?;
-        if learned {
+        let n = self.log.records.len();
+        self.digest.ingest(&self.log.records[n - 2].clone());
+        self.digest.ingest(&self.log.records[n - 1].clone());
+        self.eval.observe(&trace, chosen_tokens.len());
+        if learned_user {
             self.absorb(Role::User, input, &tok.chunks);
+        }
+        if learned_bot {
             self.absorb(Role::Bot, &chosen_text, &chosen_tokens);
-            self.pairs.push_live(
-                &self.embedder,
-                input.to_string(),
-                tok.chunks.clone(),
-                chosen_tokens.clone(),
-                self.params.n_retrieve_scan,
-            );
+            if self.params.n_adapt > 0 {
+                self.pairs.push_live(
+                    &self.embedder,
+                    input.to_string(),
+                    tok.chunks.clone(),
+                    chosen_tokens.clone(),
+                    self.params.n_retrieve_scan,
+                );
+            }
         }
         for &c in tok.chunks.iter().chain(chosen_tokens.iter()) {
             self.history.push_back(c);
@@ -404,7 +417,8 @@ impl Engine {
             }
             // Adapt (Reudy analog): deterministic, no RNG, so inserting it
             // here keeps the RNG-consumption contract of the sources below.
-            if self.params.n_adapt > 0 && self.pairs.len() > 0 {
+            // Pool mode only — exclusive is the v0.1 XOR contract.
+            if self.params.mix == MixMode::Pool && self.params.n_adapt > 0 && self.pairs.len() > 0 {
                 self.pairs.propose(
                     &mut pool,
                     &self.intern,
@@ -439,7 +453,7 @@ impl Engine {
         // register (seed-scale band fell 67→42%); the soft penalty keeps
         // covering the rest. Triggers stay: repeating the dictionary is a
         // ritual, not a rut. The fallbacks below refill an emptied pool.
-        if self.params.self_window > 0 {
+        if self.params.self_window > 0 && self.params.self_penalty > 0.0 {
             pool.items.retain(|p| {
                 p.source == PathKind::Trigger
                     || !self.recent_bot.iter().rev().take(3).any(|r| r == &p.text)
@@ -591,10 +605,15 @@ impl Engine {
         self.store.warm_sampling(kn);
         self.rev_store.warm_sampling(kn);
         let uni = self.store.sampling_view(kn).expect("warmed above");
+        // The anchor takes one slot of the hard cap; forward gets the rest
+        // and backward whatever remains — the total never exceeds
+        // max_gen_len (it used to overshoot by up to 2).
+        let mut fparams = self.params.clone();
+        fparams.max_gen_len = self.params.max_gen_len.saturating_sub(1);
         let fwd = generate_one(
             &self.store,
             self.smoothing.as_ref(),
-            &self.params,
+            &fparams,
             &[anchor],
             &[],
             uni,
@@ -603,24 +622,28 @@ impl Engine {
         );
         let mut seq = vec![anchor];
         seq.extend(fwd.tokens);
-        let mut bparams = self.params.clone();
-        bparams.max_gen_len = self.params.max_gen_len.saturating_sub(seq.len()).max(1);
-        let rev_ctx: Vec<TokenId> = seq.iter().rev().copied().collect();
-        let uni_rev = self.rev_store.sampling_view(kn).expect("warmed above");
-        let bwd = generate_one(
-            &self.rev_store,
-            self.smoothing.as_ref(),
-            &bparams,
-            &rev_ctx,
-            &[],
-            uni_rev,
-            &mut self.gen_caches_rev,
-            &mut self.rng,
-        );
-        let mut tokens: Vec<TokenId> = bwd.tokens.iter().rev().copied().collect();
-        tokens.extend(seq);
+        let budget = self.params.max_gen_len.saturating_sub(seq.len());
         let mut steps = fwd.steps;
-        steps.extend(bwd.steps);
+        let mut tokens: Vec<TokenId> = Vec::new();
+        if budget > 0 {
+            let mut bparams = self.params.clone();
+            bparams.max_gen_len = budget;
+            let rev_ctx: Vec<TokenId> = seq.iter().rev().copied().collect();
+            let uni_rev = self.rev_store.sampling_view(kn).expect("warmed above");
+            let bwd = generate_one(
+                &self.rev_store,
+                self.smoothing.as_ref(),
+                &bparams,
+                &rev_ctx,
+                &[],
+                uni_rev,
+                &mut self.gen_caches_rev,
+                &mut self.rng,
+            );
+            tokens = bwd.tokens.iter().rev().copied().collect();
+            steps.extend(bwd.steps);
+        }
+        tokens.extend(seq);
         Generated { tokens, steps }
     }
 
@@ -678,8 +701,9 @@ impl Engine {
             self.params.pref_clip,
         );
         let rec = Record::meta(if good { "good".into() } else { "bad".into() }, Some(path));
-        self.digest.ingest(&rec);
         self.log.append(rec)?;
+        let last = self.log.records.last().expect("just appended").clone();
+        self.digest.ingest(&last);
         Ok(format!(
             "pref {} {:?}  prior={:+.2}",
             if good { "good" } else { "bad" },
@@ -731,6 +755,7 @@ impl Engine {
     /// One Markov draw without embedding, logging, or topic update.
     /// Used by `munou verify` to isolate engine-path latency from hash-embed.
     pub fn markov_draw(&mut self) -> usize {
+        self.gen_caches.trim();
         let ctx: Vec<TokenId> = self.history.iter().copied().collect();
         // Last four history tokens in stream order (an earlier version
         // reversed them by accident).
@@ -911,7 +936,7 @@ fn replay_speech(
             Role::User => pending_user = Some((text.to_string(), tok.chunks.clone())),
             Role::Bot => {
                 if let Some((ut, uc)) = pending_user.take() {
-                    if *learned {
+                    if *learned && params.n_adapt > 0 {
                         pairs.push_raw(ut, uc, tok.chunks.clone());
                     }
                 }
@@ -1061,6 +1086,171 @@ mod tests {
         })
         .unwrap();
         assert!(e2.stats().utterances >= 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exclusive mode is the v0.1 XOR: no Adapt beside a trigger-less pool.
+    #[test]
+    fn exclusive_mode_has_no_adapt_candidates() {
+        let params = Params {
+            mix: MixMode::Exclusive,
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 5).unwrap();
+        e.respond("コーヒー飲む？").unwrap();
+        e.respond("散歩しよう").unwrap();
+        let r = e.respond("紅茶飲む？").unwrap();
+        assert!(
+            r.trace
+                .candidates
+                .iter()
+                .all(|c| c.source != PathKind::Adapt),
+            "exclusive pool must not contain Adapt: {:?}",
+            r.trace
+                .candidates
+                .iter()
+                .map(|c| c.source)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// max_gen_len is a hard cap; anchored bidirectional generation used to
+    /// overshoot it by up to 2.
+    #[test]
+    fn max_gen_len_is_a_hard_cap() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            max_gen_len: 3,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 17).unwrap();
+        for _ in 0..6 {
+            e.respond("あか、あお、らくだ、みどり、きいろ").unwrap();
+        }
+        for _ in 0..6 {
+            let r = e.respond("らくだ").unwrap();
+            for c in &r.trace.candidates {
+                if c.source == PathKind::Markov {
+                    assert!(
+                        c.tokens.len() <= 3,
+                        "markov candidate exceeds max_gen_len: {:?}",
+                        c.tokens
+                    );
+                }
+            }
+        }
+    }
+
+    /// n_adapt=0 must switch the pair memory off entirely (it used to keep
+    /// growing and embedding every learned turn).
+    #[test]
+    fn n_adapt_zero_disables_pair_store() {
+        let params = Params {
+            n_adapt: 0,
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 3).unwrap();
+        for line in ["こんにちは", "散歩しよう", "猫かわいい"] {
+            e.respond(line).unwrap();
+        }
+        assert_eq!(e.pairs.len(), 0, "pair store must stay empty at n_adapt=0");
+    }
+
+    /// The empty-input fallback「…」must not diverge between live and reopen:
+    /// live absorbs nothing (empty chunks), so the record must say so.
+    #[test]
+    fn empty_input_state_matches_after_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "munou-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let live;
+        {
+            let mut e = Engine::open(OpenConfig {
+                params: params.clone(),
+                seed: 9,
+                log_path: Some(log.clone()),
+                triggers_path: None,
+            })
+            .unwrap();
+            e.respond("").unwrap();
+            live = (e.stats().tokens, e.bots.len());
+        }
+        let e2 = Engine::open(OpenConfig {
+            params,
+            seed: 9,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        // vocab/hist may still drift (bot text is re-tokenised on replay —
+        // the documented asymmetry); the corpus and the retrieve store must
+        // not.
+        assert_eq!(
+            (e2.stats().tokens, e2.bots.len()),
+            live,
+            "reopen must not grow a corpus the live process never had"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn final line (crash window) must not swallow the next record.
+    #[test]
+    fn torn_log_line_does_not_swallow_next_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "munou-torn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        std::fs::write(&log, "{\"v\":1,\"t\":1,\"role\":\"user\",\"te").unwrap();
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        {
+            let mut e = Engine::open(OpenConfig {
+                params: params.clone(),
+                seed: 3,
+                log_path: Some(log.clone()),
+                triggers_path: None,
+            })
+            .unwrap();
+            e.respond("猫かわいい").unwrap();
+        }
+        let e2 = Engine::open(OpenConfig {
+            params,
+            seed: 3,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        assert_eq!(
+            e2.stats().utterances,
+            2,
+            "user+bot must both survive a torn predecessor line"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

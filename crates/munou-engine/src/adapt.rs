@@ -204,8 +204,13 @@ fn substitute(
         .copied()
         .filter(|id| is_content(intern, *id) && absent(id, &base.user_chunks))
         .collect();
-    old_only.dedup();
-    new_only.dedup();
+    // Full dedup (Vec::dedup only removes *adjacent* repeats, which wasted a
+    // substitution slot on the same chunk and could map two old chunks onto
+    // one new chunk), then rarest first.
+    let mut seen = rustc_hash::FxHashSet::default();
+    old_only.retain(|id| seen.insert(*id));
+    seen.clear();
+    new_only.retain(|id| seen.insert(*id));
     old_only.sort_by_key(|&id| store.count_of(id));
     new_only.sort_by_key(|&id| store.count_of(id));
 
@@ -256,6 +261,43 @@ mod tests {
         assert_eq!(pool.items.len(), 1);
         assert_eq!(pool.items[0].source, PathKind::Adapt);
         assert_eq!(pool.items[0].text, "Railsサイコー", "{:?}", pool.items[0]);
+    }
+
+    /// Non-adjacent duplicates must not eat the two substitution slots
+    /// (Vec::dedup only removes adjacent repeats): user [x,z,x] / reply [x,z]
+    /// with input [n1,n2] must substitute both x→ and z→, not stop at x.
+    #[test]
+    fn substitution_survives_non_adjacent_duplicates() {
+        let mut intern = Interner::new();
+        let x = intern.intern("えっくす");
+        let z = intern.intern("ぜっと");
+        let n1 = intern.intern("いち");
+        let n2 = intern.intern("に");
+        let store = Store::new(64);
+        let mut ps = PairStore::default();
+        ps.push_raw("えっくすぜっとえっくす".into(), vec![x, z, x], vec![x, z]);
+        let e = HashEmbedder::new(64);
+        ps.finish(&e, 0);
+        let mut q = vec![0.0f32; 64];
+        e.embed("いちに", &mut q);
+        let mut pool = Pool::default();
+        ps.propose(
+            &mut pool,
+            &intern,
+            &store,
+            "いちに",
+            &[n1, n2],
+            &q,
+            &q,
+            1,
+            0,
+        );
+        assert_eq!(pool.items.len(), 1);
+        let toks = &pool.items[0].tokens;
+        assert!(
+            toks.contains(&n1) && toks.contains(&n2),
+            "both differing chunks must be substituted: {toks:?}"
+        );
     }
 
     #[test]

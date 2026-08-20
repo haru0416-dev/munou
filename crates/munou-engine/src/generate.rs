@@ -4,7 +4,7 @@ use rand::Rng;
 
 use crate::alias::{nucleus, temper, AliasTable};
 use crate::explain::GenStep;
-use crate::ids::{TokenId, EOS};
+use crate::ids::{is_special, TokenId};
 use crate::params::Params;
 use crate::smoothing::Smoothing;
 use crate::sparse::sparse_step;
@@ -132,7 +132,12 @@ pub(crate) fn generate_one<R: Rng + ?Sized>(
             logp,
         });
 
-        if sampled == EOS {
+        // Any special ends the utterance. EOS is the explicit stop; a sampled
+        // SEP means the walk crossed into the next utterance's head
+        // distribution — emitting it spliced unrelated openings into replies
+        // and, once absorbed, planted SEP inside stored utterances (breaking
+        // the store's boundary invariant and live/reopen reproducibility).
+        if is_special(sampled) {
             break;
         }
         tokens.push(sampled);
@@ -395,6 +400,35 @@ mod tests {
         let uni = store.sampling_view(kn).expect("warmed");
         let mut caches = GenCaches::default();
         generate_one(store, smoothing, params, ctx, parrot, uni, &mut caches, rng)
+    }
+
+    /// Decode must never emit a special into the token stream: a sampled SEP
+    /// used to be pushed, splicing unrelated utterance openings and, once
+    /// absorbed, planting SEP inside stored utterances.
+    #[test]
+    fn decode_never_emits_specials() {
+        use crate::ids::is_special;
+        let mut store = Store::new(32);
+        for i in 0..30u32 {
+            store.push_utterance(&[20 + i % 3, 21 + i % 5]);
+        }
+        store.merge();
+        let params = Params {
+            f_min: 3,
+            l_max: 8,
+            max_gen_len: 12,
+            ..Params::default()
+        };
+        let smoothing = NaiveBackoff;
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        for _ in 0..200 {
+            let g = gen_once(&mut store, &smoothing, &params, &[20], &[], &mut rng);
+            assert!(
+                g.tokens.iter().all(|&t| !is_special(t)),
+                "special leaked into decode output: {:?}",
+                g.tokens
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,57 @@ use munou_engine::{
 
 const LOCKFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
 
+/// Closed-world allowlist: every crate the lockfile may contain. A denylist
+/// misses unknown network clients; this fails on ANY new dependency until it
+/// is reviewed and added here (dependency survey 2026-08-20: 45 crates, all
+/// MIT/Apache-family, cargo audit clean, no network/TLS/async anywhere).
+const ALLOWED_CRATES: &[&str] = &[
+    "anstream",
+    "anstyle",
+    "anstyle-parse",
+    "anstyle-query",
+    "anstyle-wincon",
+    "anyhow",
+    "cfg-if",
+    "clap",
+    "clap_builder",
+    "clap_derive",
+    "clap_lex",
+    "colorchoice",
+    "getrandom",
+    "heck",
+    "is_terminal_polyfill",
+    "itoa",
+    "libc",
+    "memchr",
+    "munou-cli",
+    "munou-engine",
+    "once_cell_polyfill",
+    "ppv-lite86",
+    "proc-macro2",
+    "quote",
+    "rand",
+    "rand_chacha",
+    "rand_core",
+    "rustc-hash",
+    "serde",
+    "serde_core",
+    "serde_derive",
+    "serde_json",
+    "strsim",
+    "syn",
+    "thiserror",
+    "thiserror-impl",
+    "unicode-ident",
+    "utf8parse",
+    "wasi",
+    "windows-link",
+    "windows-sys",
+    "zerocopy",
+    "zerocopy-derive",
+    "zmij",
+];
+
 const BANNED_CRATES: &[&str] = &[
     "async-openai",
     "burn",
@@ -66,6 +117,18 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
             "closed-deps",
             Status::Fail,
             format!("banned crates present: {names}"),
+        ),
+    }
+    match lockfile_unknown() {
+        Ok(n) => check(
+            "closed-deps-allowlist",
+            Status::Pass,
+            format!("all {n} locked crates are on the reviewed allowlist"),
+        ),
+        Err(names) => check(
+            "closed-deps-allowlist",
+            Status::Fail,
+            format!("unreviewed dependencies (add to ALLOWED_CRATES after review): {names}"),
         ),
     }
 
@@ -568,6 +631,31 @@ fn lockfile_banned() -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err(names.join(", "))
+    }
+}
+
+/// Every lockfile crate must be on the reviewed allowlist. Returns the crate
+/// count on success, the unknown names on failure.
+fn lockfile_unknown() -> std::result::Result<usize, String> {
+    let mut unknown = Vec::new();
+    let mut n = 0usize;
+    for line in LOCKFILE.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("name = \"") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix('"') else {
+            continue;
+        };
+        n += 1;
+        if !ALLOWED_CRATES.contains(&name) {
+            unknown.push(name.to_string());
+        }
+    }
+    if unknown.is_empty() {
+        Ok(n)
+    } else {
+        Err(unknown.join(", "))
     }
 }
 

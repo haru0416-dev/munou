@@ -138,11 +138,28 @@ impl AppendLog {
                 }
             }
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .map_err(|e| Error::io(path, e))?;
+        // Crash-window repair: a torn final line (no trailing newline) is
+        // skipped by the parser above, but appending directly after it would
+        // glue the next record onto the torn bytes and silently lose it.
+        // Terminate the torn line first.
+        if let Ok(meta) = file.metadata() {
+            if meta.len() > 0 {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = File::open(path).map_err(|e| Error::io(path, e))?;
+                f.seek(SeekFrom::End(-1)).map_err(|e| Error::io(path, e))?;
+                let mut last = [0u8; 1];
+                f.read_exact(&mut last).map_err(|e| Error::io(path, e))?;
+                if last[0] != b'\n' {
+                    file.write_all(b"\n").map_err(|e| Error::io(path, e))?;
+                    file.sync_data().map_err(|e| Error::io(path, e))?;
+                }
+            }
+        }
         Ok(Self {
             path: Some(path.to_path_buf()),
             file: Some(file),
