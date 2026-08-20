@@ -92,6 +92,14 @@ pub struct Trace {
     /// RLHF-lite path prior from `/good` `/bad`.
     #[serde(default)]
     pub path_prior: [f32; 5],
+    /// 日和 line for this turn (name + effective dials), e.g.
+    /// `はずみ slip×1.2 合いの手×1.6`. None when weather is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weather: Option<String>,
+    /// 合いの手 spoken before the reply this turn (display beat; not logged,
+    /// not absorbed — a verbatim copy of an already-learned line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interject: Option<String>,
 }
 
 impl Trace {
@@ -115,6 +123,12 @@ impl Trace {
         if let Some(r) = &self.route {
             s.push_str(r);
             s.push('\n');
+        }
+        if let Some(w) = &self.weather {
+            s.push_str(&format!("日和 {w}\n"));
+        }
+        if let Some(a) = &self.interject {
+            s.push_str(&format!("合いの手 「{a}」\n"));
         }
         let pr = self.path_prior;
         if pr.iter().any(|x| *x != 0.0) {

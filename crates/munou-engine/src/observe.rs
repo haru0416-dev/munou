@@ -68,6 +68,19 @@ pub struct LogDigest {
     pub last_bot: Option<LastBot>,
     /// Last ≤5 learned bot texts, oldest first.
     pub recent_learned_bot: std::collections::VecDeque<String>,
+    /// Timestamp (ms) of the first speech record — うまれた日 for あゆみ / 節目.
+    pub first_speech_t: Option<u64>,
+    /// Timestamp (ms) of the latest speech record. The 日和 day comes from
+    /// here (previous record, never the wall clock) so replies stay a pure
+    /// function of (log, seed, input).
+    pub last_speech_t: Option<u64>,
+    /// 初語 — the first learned user utterance ever absorbed.
+    pub first_learned_user: Option<String>,
+    /// よそよそしさ: speech records remaining until the post-absence damp
+    /// wears off (0 = normal). Set when a ≥7-day gap is ingested.
+    pub aloof_left: u32,
+    /// Day gap that started the current/last よそよそしさ (for the 「{n}日ぶり」line).
+    pub last_gap_days: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -93,8 +106,25 @@ impl LogDigest {
             return;
         }
         self.speech += 1;
+        if self.first_speech_t.is_none() {
+            self.first_speech_t = Some(rec.t);
+        }
+        if let Some(prev) = self.last_speech_t {
+            let gap = crate::weather::day_of_ms(rec.t)
+                .saturating_sub(crate::weather::day_of_ms(prev));
+            if gap >= crate::milestone::ALOOF_GAP_DAYS {
+                self.aloof_left = crate::milestone::ALOOF_SPEECH;
+                self.last_gap_days = gap;
+            } else {
+                self.aloof_left = self.aloof_left.saturating_sub(1);
+            }
+        }
+        self.last_speech_t = Some(rec.t);
         if rec.learned {
             self.learned += 1;
+            if rec.role == Role::User && self.first_learned_user.is_none() {
+                self.first_learned_user = Some(rec.text.clone());
+            }
         }
         if rec.role == Role::Bot {
             if let Some(p) = rec.path {

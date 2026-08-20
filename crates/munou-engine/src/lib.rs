@@ -17,6 +17,7 @@
 //! | 選択器（話題余弦・帯域ヒンジ・slip） | `select`, `embed` |
 //! | 記憶（append-only JSONL・吸収・再生） | `log`, `engine` |
 //! | 観察窓・説明・評価 | `observe`, `explain`, `eval` |
+//! | 体験層（関心・日和・合いの手・節目） | `interest`, `weather`, `interject`, `milestone` |
 //! | 大量ログの合成 | `fabricate` |
 
 mod adapt;
@@ -30,7 +31,10 @@ mod fabricate;
 mod generate;
 mod ids;
 mod intern;
+mod interest;
+mod interject;
 mod log;
+mod milestone;
 mod mix;
 mod observe;
 mod params;
@@ -44,6 +48,7 @@ mod sparse;
 mod store;
 mod tokenizer;
 mod trigger;
+mod weather;
 
 pub use engine::{Engine, OpenConfig, Reply, Stats};
 pub use error::{Error, Result};

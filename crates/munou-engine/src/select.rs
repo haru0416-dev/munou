@@ -37,6 +37,9 @@ pub struct RankInput<'a> {
     pub trigger_match: f32,
     /// Closed analog of RLHF: additive logit on PathKind from `/good` `/bad`.
     pub path_prior: [f32; 5],
+    /// Per-candidate additive term computed upstream (関心 + 気になる語).
+    /// Empty slice = no bonus. Indexed like `texts`.
+    pub bonus: &'a [f32],
 }
 
 pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32 {
@@ -103,6 +106,7 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
             + source_bias(source, params, input.trigger_match)
             + input.path_prior[crate::route::prior_index(source)]
             + surprise_term
+            + input.bonus.get(i).copied().unwrap_or(0.0)
             - rote
             - self_rote
             - params.band_penalty * band_hinge(topic_s, params.band_lo, params.band_hi);
@@ -176,6 +180,7 @@ mod tests {
                 recent_bot: &[],
                 trigger_match: 0.0,
                 path_prior: [0.0; 5],
+                bonus: &[],
             },
             &params,
             &mut rng,
@@ -209,6 +214,7 @@ mod tests {
                 recent_bot: &[],
                 trigger_match: 1.0,
                 path_prior: [0.0; 5],
+                bonus: &[],
             },
             &params,
             &mut rng,
@@ -247,6 +253,7 @@ mod tests {
                 recent_bot: &recent,
                 trigger_match: 0.0,
                 path_prior: [0.0; 5],
+                bonus: &[],
             },
             &params,
             &mut rng,

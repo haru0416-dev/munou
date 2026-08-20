@@ -96,6 +96,45 @@ pub struct Params {
     pub pref_step: f32,
     /// Clamp on each path prior.
     pub pref_clip: f32,
+    /// 日和: deterministic per-day modulation of slip / 合いの手 / 口をつく,
+    /// derived from (seed, day of the previous log record). Off = なぎ every day.
+    #[serde(default = "d_true")]
+    pub weather: bool,
+    /// 合いの手 base probability per reply (weather-scaled). 0 disables.
+    #[serde(default = "d_interject_rate")]
+    pub interject_rate: f64,
+    /// 関心 selection term: score += weight × max chunk interest. 0 disables.
+    #[serde(default = "d_interest_weight")]
+    pub interest_weight: f32,
+    /// Bonus for candidates containing the day's 気になる語 (weather-scaled).
+    #[serde(default = "d_care_bonus")]
+    pub care_bonus: f32,
+    /// 聞きかじり threshold: chunks in fewer distinct learned utterances carry
+    /// no interest and are skipped as anchors.
+    #[serde(default = "d_hearsay_min")]
+    pub hearsay_min: u32,
+    /// 口をつく: per-turn probability that hearsay chunks may anchor anyway.
+    #[serde(default = "d_hearsay_release")]
+    pub hearsay_release: f64,
+}
+
+fn d_true() -> bool {
+    true
+}
+fn d_interject_rate() -> f64 {
+    0.30
+}
+fn d_interest_weight() -> f32 {
+    0.08
+}
+fn d_care_bonus() -> f32 {
+    0.05
+}
+fn d_hearsay_min() -> u32 {
+    2
+}
+fn d_hearsay_release() -> f64 {
+    0.15
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +200,12 @@ impl Default for Params {
             k_top: 0,
             pref_step: 0.08,
             pref_clip: 0.35,
+            weather: true,
+            interject_rate: 0.30,
+            interest_weight: 0.08,
+            care_bonus: 0.05,
+            hearsay_min: 2,
+            hearsay_release: 0.15,
         }
     }
 }

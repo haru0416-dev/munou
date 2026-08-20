@@ -154,7 +154,15 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
         &trig,
         r#"[{"pattern":"おはよう","responses":["検証用おはよう"]}]"#,
     )?;
-    let mut e = Engine::ephemeral(Params::default(), 1)?;
+    // p_slip=0: this check is about ranking (trigger wins), not slip — with
+    // the default p_slip a slip roll can legitimately pick another source.
+    let mut e = Engine::ephemeral(
+        Params {
+            p_slip: 0.0,
+            ..Params::default()
+        },
+        1,
+    )?;
     e.load_triggers(&trig)?;
     let r = e.respond("おはよう")?;
     check(

@@ -51,6 +51,11 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Print あゆみ — the individual's record: birth day, 初語, 節目, 日和, 関心.
+    Ayumi {
+        #[command(flatten)]
+        common: Common,
+    },
     /// Force a generation-buffer merge + SA rebuild.
     Rebuild {
         #[command(flatten)]
@@ -192,6 +197,15 @@ struct Common {
     /// Recent bot utterances scanned for retrieve. 0 = all. Default 1024.
     #[arg(long)]
     retrieve_scan: Option<usize>,
+    /// Disable 日和 (deterministic per-day modulation; every day becomes なぎ).
+    #[arg(long)]
+    no_weather: bool,
+    /// 合いの手 base probability per reply. 0 disables the first beat.
+    #[arg(long)]
+    interject_rate: Option<f64>,
+    /// 関心 selection weight (dual-timescale chunk interest). 0 disables.
+    #[arg(long)]
+    interest_weight: Option<f32>,
 }
 
 fn main() -> Result<()> {
@@ -219,6 +233,11 @@ fn main() -> Result<()> {
                 "html" => print!("{}", o.html()),
                 _ => print!("{}", o.panel()),
             }
+            Ok(())
+        }
+        Command::Ayumi { common } => {
+            let e = open(common)?;
+            print!("{}", e.ayumi_text());
             Ok(())
         }
         Command::Rebuild { common } => {
@@ -365,6 +384,15 @@ fn params_from(c: &Common) -> Params {
             _ => MixMode::Pool,
         };
     }
+    if c.no_weather {
+        p.weather = false;
+    }
+    if let Some(r) = c.interject_rate {
+        p.interject_rate = r.clamp(0.0, 1.0);
+    }
+    if let Some(w) = c.interest_weight {
+        p.interest_weight = w.max(0.0);
+    }
     p
 }
 
@@ -382,7 +410,13 @@ fn open(c: Common) -> Result<Engine> {
 fn say(c: Common, text: &str, explain: bool) -> Result<()> {
     let mut e = open(c)?;
     let r = e.respond(text)?;
+    if let Some(a) = &r.interject {
+        println!("{a}");
+    }
     println!("{}", r.text);
+    if let Some(m) = &r.milestone {
+        println!("（{m}）");
+    }
     if explain {
         print!("{}", r.trace.explain_text());
     }
@@ -395,7 +429,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
     let mut stdout = io::stdout();
     writeln!(
         stdout,
-        "人工無脳君  seed={}  /observe /why /good /bad /stats /eval /rebuild /retok /explain /quit",
+        "人工無脳君  seed={}  /observe /why /ayumi /good /bad /stats /eval /rebuild /retok /explain /quit",
         e.seed()
     )?;
     stdout.flush()?;
@@ -415,6 +449,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             "/quit" | "/exit" => break,
             "/observe" => print!("{}", e.observe().panel()),
             "/why" => print!("{}", e.why_text()),
+            "/ayumi" => print!("{}", e.ayumi_text()),
             "/good" => writeln!(stdout, "{}", e.feedback(true)?)?,
             "/bad" => writeln!(stdout, "{}", e.feedback(false)?)?,
             "/stats" => {
@@ -440,7 +475,13 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             }
             _ => {
                 let r = e.respond(t)?;
+                if let Some(a) = &r.interject {
+                    writeln!(stdout, "{a}")?;
+                }
                 writeln!(stdout, "{}", r.text)?;
+                if let Some(m) = &r.milestone {
+                    writeln!(stdout, "（{m}）")?;
+                }
                 writeln!(stdout, "{}", e.observe().strip())?;
                 if explain {
                     print!("{}", r.trace.explain_text());

@@ -14,9 +14,13 @@ use crate::explain::{GenStep, PathKind, Trace};
 use crate::generate::{generate_one, GenCaches, Generated};
 use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
+use crate::interest::InterestLedger;
+use crate::interject::InterjectBank;
 use crate::log::{AppendLog, Record, Role};
+use crate::milestone;
 use crate::mix::Pool;
 use crate::observe::{LogDigest, Observe};
+use crate::weather;
 use crate::params::{MixMode, Params, SmoothingKind};
 use crate::retrieve::BotStore;
 use crate::route;
@@ -37,6 +41,12 @@ pub struct OpenConfig {
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub text: String,
+    /// 合いの手 — a short first beat before `text`, harvested from the own
+    /// log. Display only: not logged, not absorbed (replay stays exact).
+    pub interject: Option<String>,
+    /// 節目 — a growth mark crossed by this turn (counts and days, not fake
+    /// emotion). Derived from the log digest, so it never re-fires on replay.
+    pub milestone: Option<String>,
     pub trace: Trace,
 }
 
@@ -91,6 +101,10 @@ pub struct Engine {
     /// Text, not tokens: the penalty is char-level so live and replay agree
     /// exactly (token ids drift across reopen).
     recent_bot: VecDeque<String>,
+    /// 関心 — dual-timescale chunk weights on the log-position clock.
+    interest: InterestLedger,
+    /// 合いの手 bank — short learned lines with frequencies.
+    interjects: InterjectBank,
 }
 
 impl Engine {
@@ -155,6 +169,8 @@ impl Engine {
             recent_bot,
             pairs,
             rev_store,
+            interest,
+            interjects,
         } = replayed;
 
         let mut eval = EvalAccum::default();
@@ -189,6 +205,8 @@ impl Engine {
             gen_caches: GenCaches::default(),
             gen_caches_rev: GenCaches::default(),
             recent_bot,
+            interest,
+            interjects,
         })
     }
 
@@ -205,18 +223,69 @@ impl Engine {
         let input = input.trim();
         let tok = self.tokenizer.tokenize(&mut self.intern, input);
 
+        // 日和: the day is the UTC day of the *previous* log record — never
+        // the wall clock at scoring time — so a reply stays a pure function
+        // of (log, seed, input) and replays reproduce the same weather.
+        let day = self.digest.last_speech_t.map(weather::day_of_ms);
+        let wthr = if self.params.weather {
+            day.map(|d| weather::day_weather(self.seed, d))
+                .unwrap_or(&weather::CALM)
+        } else {
+            &weather::CALM
+        };
+        let aloof = self.digest.aloof_left > 0;
+        let gains = weather::effective(wthr, aloof);
+        // 口をつく: one draw per turn, before the sources (RNG order is part
+        // of the reproducibility contract — this draw comes first from
+        // v0.1.15 on).
+        let release_roll: f64 = crate::rng::rand_f64(&mut self.rng);
+        let release = release_roll < (self.params.hearsay_release * gains.release).clamp(0.0, 1.0);
+        let care = day.and_then(|d| self.care_word(d));
+
         let mut q = vec![0.0f32; self.embedder.dim()];
         self.embedder.embed(input, &mut q);
         self.topic.push(&q);
         let mut topic = vec![0.0f32; self.embedder.dim()];
         self.topic.mean(&mut topic);
 
-        let (pool, steps, trigger_tr, route) = self.propose_all(input, &tok, &topic, &q);
+        let (pool, steps, trigger_tr, route) = self.propose_all(input, &tok, &topic, &q, release);
 
         let texts = pool.texts();
         let toks = pool.tokens();
         let sources = pool.sources();
         let surprises = pool.surprises();
+
+        // 関心 + 気になる語: additive selection term per candidate. Hearsay
+        // chunks carry no interest (score() is None for them).
+        let bonus: Vec<f32> = toks
+            .iter()
+            .zip(texts.iter())
+            .map(|(tk, tx)| {
+                let mut b = 0.0f32;
+                if self.params.interest_weight != 0.0 {
+                    let mut best = 0.0f32;
+                    for &id in tk.iter() {
+                        if is_special(id) {
+                            continue;
+                        }
+                        if let Some(s) = self.interest.score(id, self.params.hearsay_min) {
+                            best = best.max(s);
+                        }
+                    }
+                    b += self.params.interest_weight * best;
+                }
+                if let Some(cw) = &care {
+                    if gains.care != 0.0 && tx.contains(cw.as_str()) {
+                        b += self.params.care_bonus * gains.care;
+                    }
+                }
+                b
+            })
+            .collect();
+
+        // 日和は slip の量だけを動かす（帯域・減点はそのまま）。
+        let mut eff = self.params.clone();
+        eff.p_slip = (eff.p_slip * gains.slip).clamp(0.0, 1.0);
 
         self.recent_bot.make_contiguous();
         let (recent_bot, _) = self.recent_bot.as_slices();
@@ -232,8 +301,9 @@ impl Engine {
                 surprises: &surprises,
                 trigger_match: trigger_tr.as_ref().map(|t| t.similarity).unwrap_or(0.0),
                 path_prior: self.path_prior,
+                bonus: &bonus,
             },
-            &self.params,
+            &eff,
             &mut self.rng,
         );
 
@@ -268,6 +338,40 @@ impl Engine {
         let learn_roll: f64 = crate::rng::rand_f64(&mut self.rng);
         let learned = learn_roll < self.params.p_learn.clamp(0.0, 1.0);
 
+        // 合いの手: a short first beat from the own log's frequency
+        // distribution. One roll when the bank is live; one pick when it
+        // fires. Skipped for replies that are already beat-sized.
+        let interject = if self.params.interject_rate > 0.0
+            && self.interjects.distinct() >= crate::interject::MIN_DISTINCT
+        {
+            let roll: f64 = crate::rng::rand_f64(&mut self.rng);
+            if roll < (self.params.interject_rate * gains.interject).clamp(0.0, 1.0)
+                && chosen_text.chars().count() > 4
+            {
+                self.interjects.pick(&mut self.rng, &chosen_text)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let weather_note = if self.params.weather && day.is_some() {
+            let mut s = format!(
+                "{} slip×{:.2} 合いの手×{:.2} 口をつく×{:.2}",
+                wthr.name, gains.slip, gains.interject, gains.release
+            );
+            if let Some(cw) = &care {
+                s.push_str(&format!(" 気になる語「{cw}」"));
+            }
+            if aloof {
+                s.push_str("（よそよそしい）");
+            }
+            Some(s)
+        } else {
+            None
+        };
+
         let trace = Trace {
             seed: self.seed,
             path,
@@ -288,7 +392,7 @@ impl Engine {
             chosen_rank,
             slipped: ranked.slipped,
             slip_roll: ranked.slip_roll,
-            p_slip: self.params.p_slip,
+            p_slip: eff.p_slip,
             learned: learned && !(tok.chunks.is_empty() && chosen_tokens.is_empty()),
             learn_roll,
             p_learn: self.params.p_learn,
@@ -299,6 +403,8 @@ impl Engine {
             band_hit,
             route: Some(route.explain_line()),
             path_prior: self.path_prior,
+            weather: weather_note,
+            interject: interject.clone(),
         };
 
         // Per-side learned flags: an empty chunk list absorbs nothing live,
@@ -318,11 +424,18 @@ impl Engine {
             chosen_tokens.len(),
         );
         // Append first: the log is the source of truth, and digest/eval must
-        // not advance when the write fails.
+        // not advance when the write fails. 節目 is a digest crossing, so the
+        // pre-append values are captured here.
+        let pre_learned = self.digest.learned;
+        let pre_last_t = self.digest.last_speech_t;
+        let pre_aloof = self.digest.aloof_left;
         self.log.append_turn(rec_user, rec_bot)?;
         let n = self.log.records.len();
         self.digest.ingest(&self.log.records[n - 2].clone());
         self.digest.ingest(&self.log.records[n - 1].clone());
+        let milestone = milestone::lines(pre_learned, pre_last_t, pre_aloof, &self.digest)
+            .into_iter()
+            .next();
         self.eval.observe(&trace, chosen_tokens.len());
         if learned_user {
             self.absorb(Role::User, input, &tok.chunks);
@@ -354,8 +467,31 @@ impl Engine {
 
         Ok(Reply {
             text: chosen_text,
+            interject,
+            milestone,
             trace,
         })
+    }
+
+    /// きょうの気になる語: a deterministic pick among established (non-hearsay)
+    /// chunks, keyed by (seed, day). Sorted by surface string so the pick
+    /// survives reopen (token ids drift, text does not).
+    fn care_word(&self, day: u64) -> Option<String> {
+        if !self.params.weather || self.params.care_bonus == 0.0 {
+            return None;
+        }
+        let ids = self.interest.established(self.params.hearsay_min);
+        let mut words: Vec<&str> = ids
+            .iter()
+            .map(|id| self.intern.get(*id))
+            .filter(|s| !crate::tokenizer::is_punct_str(s) && s.chars().count() >= 2)
+            .collect();
+        if words.is_empty() {
+            return None;
+        }
+        words.sort_unstable();
+        words.dedup();
+        Some(words[weather::care_index(self.seed, day, words.len())].to_string())
     }
 
     /// Route, then let every gated source propose into one pool: trigger →
@@ -368,6 +504,7 @@ impl Engine {
         tok: &Tokenized,
         topic: &[f32],
         input_emb: &[f32],
+        release: bool,
     ) -> (
         Pool,
         Vec<crate::explain::GenStep>,
@@ -439,7 +576,7 @@ impl Engine {
                 route.n_cand
             };
             if markov_ok && n_cand > 0 {
-                self.propose_markov(&mut pool, &tok.chunks, &mut steps, n_cand);
+                self.propose_markov(&mut pool, &tok.chunks, &mut steps, n_cand, release);
             }
             if route.run_echo {
                 self.propose_echo(&mut pool, tok);
@@ -473,6 +610,14 @@ impl Engine {
         if chunks.is_empty() {
             return;
         }
+        // 体験層: 関心の帳簿と合いの手バンクは、吸収された発話だけを食べる
+        // （replay と同じ条件・同じ順序）。
+        {
+            let intern = &self.intern;
+            self.interest
+                .learn(chunks, |id| crate::tokenizer::is_punct_str(intern.get(id)));
+        }
+        self.interjects.learn(text);
         self.gen_caches.clear();
         self.gen_caches_rev.clear();
         self.store.push_utterance(chunks);
@@ -497,6 +642,7 @@ impl Engine {
         user_chunks: &[TokenId],
         steps: &mut Vec<crate::explain::GenStep>,
         n_cand: usize,
+        release: bool,
     ) {
         let mut ctx_seed: Vec<TokenId> = self.history.iter().copied().collect();
         ctx_seed.extend_from_slice(user_chunks);
@@ -510,7 +656,7 @@ impl Engine {
         // MegaHAL analog: anchor on the rarest in-corpus content chunk of the
         // input and grow the reply in both directions around it. Half the
         // candidate slots try this when an anchor exists.
-        let anchor = self.pick_anchor(user_chunks);
+        let anchor = self.pick_anchor(user_chunks, release);
         let n_bi = if anchor.is_some() { n_cand / 2 } else { 0 };
         let mut seen = FxHashSet::default();
         let mut attempts = 0;
@@ -573,7 +719,10 @@ impl Engine {
 
     /// Rarest in-corpus content chunk of the input; ties go to the later
     /// position (fresher topic). None when nothing usable is in the corpus.
-    fn pick_anchor(&self, user_chunks: &[TokenId]) -> Option<TokenId> {
+    /// 聞きかじり (heard in fewer than `hearsay_min` utterances) does not
+    /// anchor — a one-off typo must not become the centrepiece — except on
+    /// 口をつく turns (`release`), when it may slip out.
+    fn pick_anchor(&self, user_chunks: &[TokenId], release: bool) -> Option<TokenId> {
         if !self.params.bidir || self.store.is_empty() || self.rev_store.is_empty() {
             return None;
         }
@@ -584,6 +733,9 @@ impl Engine {
             }
             let c = self.store.count_of(id);
             if c == 0 {
+                continue;
+            }
+            if !release && self.interest.is_hearsay(id, self.params.hearsay_min) {
                 continue;
             }
             let better = match best {
@@ -734,6 +886,90 @@ impl Engine {
         self.eval.summary(&self.params)
     }
 
+    /// あゆみ — the one-page record of this individual: birth day, 初語,
+    /// counts, marks, today's 日和, and the current 関心 top words. Every
+    /// number is derived from the log; nothing here is a mood model.
+    pub fn ayumi_text(&self) -> String {
+        let s = self.stats();
+        let d = &self.digest;
+        let mut out = String::new();
+        out.push_str("あゆみ — 人工無脳君\n");
+        match (d.first_speech_t, d.last_speech_t) {
+            (Some(f), Some(l)) => {
+                let fd = weather::day_of_ms(f);
+                let (y, m, dd) = weather::civil_from_day(fd);
+                let age = weather::day_of_ms(l).saturating_sub(fd);
+                out.push_str(&format!(
+                    "うまれた日  {y:04}-{m:02}-{dd:02}（{}日目）\n",
+                    age + 1
+                ));
+                if let Some(fw) = &d.first_learned_user {
+                    out.push_str(&format!("初語        「{fw}」\n"));
+                }
+                let (lm, dm) = milestone::achieved(d.learned, age);
+                if !lm.is_empty() || !dm.is_empty() {
+                    let lms: Vec<String> = lm.iter().map(|m| format!("吸収{m}")).collect();
+                    let dms: Vec<String> = dm.iter().map(|m| format!("{m}日")).collect();
+                    out.push_str(&format!(
+                        "節目        {}\n",
+                        lms.into_iter().chain(dms).collect::<Vec<_>>().join(" ")
+                    ));
+                }
+                if self.params.weather {
+                    let day = weather::day_of_ms(l);
+                    let w = weather::day_weather(self.seed, day);
+                    let care = self
+                        .care_word(day)
+                        .map(|c| format!("  気になる語「{c}」"))
+                        .unwrap_or_default();
+                    let aloof = if d.aloof_left > 0 {
+                        "（よそよそしい）"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("日和        {}{care}{aloof}\n", w.name));
+                }
+            }
+            _ => out.push_str("うまれた日  （まだ記録なし）\n"),
+        }
+        out.push_str(&format!(
+            "発話 {}  吸収 {}  tokens {}  vocab {}\n",
+            s.utterances, s.learned, s.tokens, s.vocab
+        ));
+        let p = &d.paths;
+        if d.path_known > 0 {
+            out.push_str(&format!(
+                "経路        trig={} mark={} retr={} echo={} adpt={}\n",
+                p[0], p[1], p[2], p[3], p[4]
+            ));
+        }
+        let mut tops: Vec<(String, f32)> = self
+            .interest
+            .established(self.params.hearsay_min)
+            .into_iter()
+            .filter_map(|id| {
+                self.interest
+                    .score(id, self.params.hearsay_min)
+                    .map(|sc| (self.intern.get(id).to_string(), sc))
+            })
+            .filter(|(w, _)| !crate::tokenizer::is_punct_str(w))
+            .collect();
+        tops.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        tops.truncate(5);
+        if !tops.is_empty() {
+            let line: Vec<String> = tops
+                .iter()
+                .map(|(w, sc)| format!("{w}({sc:.2})"))
+                .collect();
+            out.push_str(&format!("関心        {}\n", line.join(" ")));
+        }
+        out
+    }
+
     pub fn observe(&self) -> Observe {
         Observe::from_parts(
             &self.stats(),
@@ -800,6 +1036,8 @@ impl Engine {
         self.recent_bot = replayed.recent_bot;
         self.pairs = replayed.pairs;
         self.rev_store = replayed.rev_store;
+        self.interest = replayed.interest;
+        self.interjects = replayed.interjects;
         self.gen_caches.clear();
         self.gen_caches_rev.clear();
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
@@ -825,6 +1063,8 @@ struct Replayed {
     recent_bot: VecDeque<String>,
     pairs: PairStore,
     rev_store: Store,
+    interest: InterestLedger,
+    interjects: InterjectBank,
 }
 
 /// MegaHAL's surprise: mean −ln p over the generation steps (None when no
@@ -902,6 +1142,8 @@ fn replay_speech(
     let mut bots = BotStore::default();
     let mut pairs = PairStore::default();
     let mut recent_bot: VecDeque<String> = VecDeque::new();
+    let mut interest = InterestLedger::default();
+    let mut interjects = InterjectBank::default();
     // (user utterance, chunks) waiting for the reply that completes a pair.
     let mut pending_user: Option<(String, Vec<TokenId>)> = None;
 
@@ -930,6 +1172,12 @@ fn replay_speech(
             }
             if *role == Role::Bot {
                 bots.push_raw(text.to_string(), tok.chunks.clone());
+            }
+            if !tok.chunks.is_empty() {
+                interest.learn(&tok.chunks, |id| {
+                    crate::tokenizer::is_punct_str(intern.get(id))
+                });
+                interjects.learn(text);
             }
         }
         match *role {
@@ -978,6 +1226,8 @@ fn replay_speech(
         recent_bot,
         pairs,
         rev_store,
+        interest,
+        interjects,
     }
 }
 
@@ -1426,6 +1676,146 @@ mod tests {
             "replayed topic window must match the live one (user inputs only)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 合いの手 is deterministic for a fixed seed and fires once the bank is
+    /// live (three distinct short learned lines) at rate 1.
+    #[test]
+    fn interject_beat_fires_and_matches_between_same_seeds() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            interject_rate: 1.0,
+            ..Params::default()
+        };
+        let mut a = Engine::ephemeral(params.clone(), 11).unwrap();
+        let mut b = Engine::ephemeral(params, 11).unwrap();
+        let lines = [
+            "はい",
+            "うん",
+            "おお",
+            "今日はとてもいい天気だね",
+            "散歩にいこうよ",
+            "コーヒーのむ？",
+        ];
+        let mut fired = false;
+        for l in lines.iter().chain(lines.iter()) {
+            let ra = a.respond(l).unwrap();
+            let rb = b.respond(l).unwrap();
+            assert_eq!(ra.text, rb.text, "l={l}");
+            assert_eq!(ra.interject, rb.interject, "l={l}");
+            if ra.interject.is_some() {
+                fired = true;
+            }
+        }
+        assert!(fired, "rate=1 with a live bank must produce a beat");
+    }
+
+    /// 節目 fires exactly on the crossing turn and never again.
+    #[test]
+    fn milestone_fires_on_learned_crossing() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 5).unwrap();
+        let mut got = Vec::new();
+        for i in 0..6 {
+            let r = e.respond(&format!("こんにちは{i}")).unwrap();
+            if let Some(m) = r.milestone {
+                got.push((i, m));
+            }
+        }
+        // 2 learned records per turn → the 吸収10 crossing is turn index 4.
+        assert_eq!(got, vec![(4usize, "節目 吸収10".to_string())]);
+    }
+
+    /// The 合いの手 bank is replay-derived: reopening must reconstruct the
+    /// same (text, count) sequence the live process built.
+    #[test]
+    fn interject_bank_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "munou-beat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let live;
+        {
+            let mut e = Engine::open(OpenConfig {
+                params: params.clone(),
+                seed: 9,
+                log_path: Some(log.clone()),
+                triggers_path: None,
+            })
+            .unwrap();
+            for l in ["はい", "うん", "おお", "はい"] {
+                e.respond(l).unwrap();
+            }
+            live = e.interjects.entries();
+        }
+        let e2 = Engine::open(OpenConfig {
+            params,
+            seed: 9,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        assert_eq!(e2.interjects.entries(), live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 聞きかじり must not anchor while hearsay (release=false); 口をつく
+    /// (release=true) lifts the gate.
+    #[test]
+    fn hearsay_gate_controls_anchoring() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            hearsay_release: 0.0,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 17).unwrap();
+        e.respond("あか、あお、らくだ、みどり").unwrap();
+        let tok = e.tokenizer.tokenize(&mut e.intern, "らくだ");
+        let id = *tok.chunks.first().expect("らくだ tokenises");
+        if e.store.count_of(id) > 0 {
+            let hearsay = e.interest.is_hearsay(id, e.params.hearsay_min);
+            let gated = e.pick_anchor(&tok.chunks, false);
+            if hearsay {
+                assert_eq!(gated, None, "hearsay chunk must not anchor");
+            }
+            assert!(
+                e.pick_anchor(&tok.chunks, true).is_some(),
+                "release must lift the gate for an in-corpus chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn ayumi_reports_birth_and_first_word() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 7).unwrap();
+        e.respond("はじめてのあいさつ").unwrap();
+        let a = e.ayumi_text();
+        assert!(a.contains("うまれた日"), "{a}");
+        assert!(a.contains("初語"), "{a}");
+        assert!(a.contains("はじめてのあいさつ"), "{a}");
+        assert!(a.contains("発話 2"), "{a}");
     }
 
     #[test]

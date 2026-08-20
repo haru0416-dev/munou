@@ -29,7 +29,12 @@ fn trigger_wins_greeting_against_echo() {
         r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
     )
     .unwrap();
-    let mut e = Engine::ephemeral(Params::default(), 3).unwrap();
+    // p_slip=0: the test is about ranking (trigger beats echo), not slip.
+    let params = Params {
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 3).unwrap();
     e.load_triggers(&trig).unwrap();
     let r = e.respond("おはよう").unwrap();
     assert_eq!(r.trace.path, PathKind::Trigger);
@@ -604,7 +609,12 @@ fn hybrid_pool_still_lists_echo_with_router() {
         r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
     )
     .unwrap();
-    let mut e = Engine::ephemeral(Params::default(), 3).unwrap();
+    // p_slip=0: the test is about the pool listing echo, not slip.
+    let params = Params {
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 3).unwrap();
     e.load_triggers(&trig).unwrap();
     let r = e.respond("おはよう").unwrap();
     assert_eq!(r.trace.path, PathKind::Trigger);
