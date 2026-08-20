@@ -76,6 +76,13 @@ pub struct Trace {
 }
 
 impl Trace {
+    pub fn explain_compact(&self) -> String {
+        format!(
+            "path={:?} learned={} sim={:.3} slipped={}",
+            self.path, self.learned, self.similarity, self.slipped
+        )
+    }
+
     pub fn explain_text(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!(

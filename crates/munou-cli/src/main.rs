@@ -10,7 +10,10 @@ mod probe;
 mod verify;
 
 #[derive(Parser, Debug)]
-#[command(name = "munou", about = "人工無脳君 — LLM を使わない対話エンジン")]
+#[command(
+    name = "munou",
+    about = "人工無脳君 — 観察できる育成。LLM を使わない対話エンジン"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -38,6 +41,14 @@ enum Command {
     Stats {
         #[command(flatten)]
         common: Common,
+    },
+    /// Print the raising window (gauges from log + eval). Adapters are out of scope.
+    Observe {
+        #[command(flatten)]
+        common: Common,
+        /// `text` (default) or `html` (self-contained; stdout; no server).
+        #[arg(long, default_value = "text")]
+        format: String,
     },
     /// Force a generation-buffer merge + SA rebuild.
     Rebuild {
@@ -128,6 +139,15 @@ fn main() -> Result<()> {
                 "utterances={} learned={} tokens={} vocab={} buf={} topic_k={}",
                 s.utterances, s.learned, s.tokens, s.vocab, s.buf, s.topic_window
             );
+            Ok(())
+        }
+        Command::Observe { common, format } => {
+            let e = open(common)?;
+            let o = e.observe();
+            match format.to_ascii_lowercase().as_str() {
+                "html" => print!("{}", o.html()),
+                _ => print!("{}", o.panel()),
+            }
             Ok(())
         }
         Command::Rebuild { common } => {
@@ -233,7 +253,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
     let mut stdout = io::stdout();
     writeln!(
         stdout,
-        "人工無脳君  seed={}  /why /stats /eval /rebuild /retok /explain /quit",
+        "人工無脳君  seed={}  /observe /why /stats /eval /rebuild /retok /explain /quit",
         e.seed()
     )?;
     stdout.flush()?;
@@ -251,6 +271,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
         }
         match t {
             "/quit" | "/exit" => break,
+            "/observe" => print!("{}", e.observe().panel()),
             "/why" => {
                 if let Some(tr) = e.last_trace() {
                     print!("{}", tr.explain_text());
@@ -282,6 +303,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             _ => {
                 let r = e.respond(t)?;
                 writeln!(stdout, "{}", r.text)?;
+                writeln!(stdout, "{}", e.observe().strip())?;
                 if explain {
                     print!("{}", r.trace.explain_text());
                 }

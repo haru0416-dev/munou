@@ -3,13 +3,14 @@
 //! Functional checks fail the process. Known v0.1 gaps (mmap, hot-path arena)
 //! print as SKIP. The 10^7 RSS check runs only when `--sa-tokens` is large enough.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use munou_engine::{Engine, Interner, OpenConfig, Params, PathKind, Tokenizer};
+use munou_engine::{Engine, Interner, OpenConfig, Params, PathKind, Stage, Tokenizer};
 
 const LOCKFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
 
@@ -181,6 +182,16 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
             st0.tokens, st0.learned, st0.utterances
         ),
     );
+    let logged = enl.observe();
+    check(
+        "observe-logged",
+        if logged.stage == Stage::Logged && logged.panel().contains("記録中") {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        format!("stage={:?}", logged.stage),
+    );
 
     let mut eal = Engine::ephemeral(
         Params {
@@ -202,6 +213,48 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
             "learned={} tokens={}",
             ral.trace.learned,
             eal.stats().tokens
+        ),
+    );
+
+    let empty_obs = Engine::ephemeral(Params::default(), 1)?.observe();
+    check(
+        "observe-empty",
+        if empty_obs.stage == Stage::Empty && !empty_obs.panel().is_empty() {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        format!(
+            "stage={:?} panel_len={}",
+            empty_obs.stage,
+            empty_obs.panel().len()
+        ),
+    );
+
+    let seed = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/seed.jsonl");
+    let seed_dir = dir.join("seed-obs");
+    std::fs::create_dir_all(&seed_dir)?;
+    std::fs::copy(&seed, seed_dir.join("log.jsonl"))?;
+    let grown = Engine::open(OpenConfig {
+        params: Params::default(),
+        seed: 1,
+        log_path: Some(seed_dir.join("log.jsonl")),
+        triggers_path: None,
+    })?;
+    let seed_obs = grown.observe();
+    check(
+        "observe-seed",
+        if seed_obs.learned == 50
+            && seed_obs.stage == Stage::Growing
+            && seed_obs.panel().contains("育ち")
+        {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        format!(
+            "learned={} stage={:?} tokens={}",
+            seed_obs.learned, seed_obs.stage, seed_obs.tokens
         ),
     );
 

@@ -1,4 +1,5 @@
 use crate::explain::Trace;
+use crate::log::{Record, Role};
 use crate::params::Params;
 
 #[derive(Debug, Clone, Default)]
@@ -23,6 +24,28 @@ impl EvalAccum {
         self.sim_sum += tr.similarity;
         self.lcs_sum += tr.novelty_lcs;
         self.lcs_len_sum += gen_len;
+    }
+
+    /// Replay a bot JSONL line so `/eval` and gauges survive process restart.
+    pub fn ingest_bot(&mut self, rec: &Record, params: &Params) {
+        if rec.role != Role::Bot {
+            return;
+        }
+        let Some(score) = rec.score else {
+            return;
+        };
+        self.n += 1;
+        if score >= params.band_lo && score <= params.band_hi {
+            self.band_hits += 1;
+        }
+        if rec.slipped == Some(true) {
+            self.slip_n += 1;
+        }
+        self.sim_sum += score;
+        if let (Some(lcs), Some(n_tok)) = (rec.novelty_lcs, rec.n_tok) {
+            self.lcs_sum += lcs;
+            self.lcs_len_sum += n_tok;
+        }
     }
 
     pub fn summary(&self, params: &Params) -> String {

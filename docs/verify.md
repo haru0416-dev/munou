@@ -8,7 +8,7 @@
 
 ## 結論
 
-v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会話ログから育つ）は満たしている。v0.1.1 で候補は XOR ではなくプール（トリガー / 検索 / マルコフ / エコー）。設計 §2.2 の速度・常駐メモリは **release 実測で要件内**。mmap コールドスタートとホットパスのヒープゼロは未実装で、検証コマンドでは SKIP としている。
+v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会話ログから育つ）は満たしている。v0.1.1 で候補は XOR ではなくプール（トリガー / 検索 / マルコフ / エコー）。v0.1.2 でライブ吸収は `p_learn`。v0.1.3 で観察窓が本線（アダプタは劣後）。設計 §2.2 の速度・常駐メモリは **release 実測で要件内**。mmap コールドスタートとホットパスのヒープゼロは未実装で、検証コマンドでは SKIP としている。
 
 検証中に直したもの:
 
@@ -22,16 +22,16 @@ v0.1 の約束（CLI、閉じたマルコフ生成、説明可能な選択、会
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS（unit 24 + spec 16） |
+| `cargo test --workspace` | PASS（unit 28 + spec 20） |
 
-spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップを固定する。
+spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL がソース・オブ・トゥルース、KN 応答、ユーザー文脈、lockfile の閉じた依存、`sync_data` 後の再開、`p_learn` の吸収/スキップ、観察窓（空 / シード育ち / 記録中 / path 再開）を固定する。
 
 ## 四性質
 
 | 性質 | 判定 | 根拠 |
 |---|---|---|
 | 説明可能 | PASS | `/why` と `say --explain` が path・形態素・チャンク・候補スコア・ズレ roll・生成ステップを出す。spec `explain_chain_is_complete` |
-| 育てられる | PASS | `log.jsonl` が追記され再オープンで復元。ライブでは `p_learn` でコーパスへ吸収（既定 0.35）。シードログは `learned` 省略＝吸収済み。`data/seed.jsonl` 25往復で tokens 0→176 / vocab 0→99。同じ8入力で空と 7/8 が食い違う（`munou probe`）。候補はトリガー/検索/マルコフ/エコーのプール |
+| 育てられる | PASS | `log.jsonl` が追記され再オープンで復元。ライブでは `p_learn` でコーパスへ吸収（既定 0.35）。シードログは `learned` 省略＝吸収済み。`data/seed.jsonl` 25往復で tokens 0→176 / vocab 0→99。同じ8入力で空と 7/8 が食い違う（`munou probe`）。候補はトリガー/検索/マルコフ/エコーのプール。観察窓は発話・吸収・語彙・帯域・暗記・ズレのゲージ（`munou observe`）。stage はカウント由来。伺か / Misskey は未実装（劣後） |
 | 閉じている | PASS | `Cargo.lock` に reqwest / candle / tokenizers / llama 等なし。生成はマルコフのみ。embedding は選択用ハッシュ。学習コーパスは自分のログ。トリガー辞書はユーザー供給（形態素辞書と同じ例外枠） |
 | ズレる | PASS | `p_slip=0` で slip なし、`p_slip=1` かつ候補≥2 で 2 位以下を採用 |
 
@@ -41,8 +41,9 @@ spec テストはトリガー排他、`p_slip`、説明チェーン、JSONL が�
 
 1. `おはよう` → path=Trigger、辞書応答 `おはよう`、sim=1.000
 2. `今日はいい天気だね` → path=Markov。コーパスが挨拶中心なので候補も挨拶に寄る（閉じていることの実演）
-3. `log.jsonl` に user/bot が 2 ターン分追記され、`score` / `slipped` / `learned` が残る
+3. `log.jsonl` に user/bot が 2 ターン分追記され、`score` / `slipped` / `learned` / `path` が残る
 4. 別ディレクトリ・同一シードで `散歩しようか` の応答が一致
+5. `munou observe` が非空のパネルを出し、シードログでは stage=育ち・learned=50
 
 ## 非機能要件 §2.2
 
@@ -121,4 +122,4 @@ PASS / FAIL  … 必須。FAIL があるとプロセスは非ゼロ終了
 SKIP         … v0.1 でやらないと決めた項目、または debug では測らない NFR
 ```
 
-`--sa-tokens` が 10^7 未満だと `rss-1e7` は SKIP。CI は `verify --sa-tokens 20000 --turns 40` と `probe --seed data/seed.jsonl`。
+`--sa-tokens` が 10^7 未満だと `rss-1e7` は SKIP。CI は `verify --sa-tokens 20000 --turns 40` と `probe --seed data/seed.jsonl`。verify は `observe-empty` / `observe-logged` / `observe-seed` を含む。

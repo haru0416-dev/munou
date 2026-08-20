@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::explain::PathKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +28,15 @@ pub struct Record {
     /// Missing field (old seed logs) means learned — the file is a corpus.
     #[serde(default = "default_learned")]
     pub learned: bool,
+    /// Winning source. Written on bot turns from v0.1.3 so path mix survives reopen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathKind>,
+    /// Token LCS against prior absorbed utterances (bot turns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub novelty_lcs: Option<usize>,
+    /// Chosen candidate length in tokens (for rote reconstruction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_tok: Option<usize>,
 }
 
 fn default_learned() -> bool {
