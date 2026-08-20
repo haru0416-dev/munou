@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeSet;
+
 use anyhow::{bail, Context, Result};
 use munou_engine::{Engine, OpenConfig, Params, PathKind};
 
@@ -35,6 +37,7 @@ struct Row {
     gen_len: usize,
     elapsed_us: u128,
     text: String,
+    n_sources: usize,
 }
 
 struct Run {
@@ -63,6 +66,13 @@ fn collect(engine: &mut Engine, prompts: &[&str]) -> Result<Vec<Row>> {
             gen_len: r.trace.chunks.len(),
             elapsed_us: r.trace.elapsed_us,
             text: r.text,
+            n_sources: r
+                .trace
+                .candidates
+                .iter()
+                .map(|c| c.source)
+                .collect::<BTreeSet<_>>()
+                .len(),
         });
     }
     Ok(rows)
@@ -106,6 +116,8 @@ fn path_tag(p: PathKind) -> &'static str {
     match p {
         PathKind::Trigger => "Trig",
         PathKind::Markov => "Mark",
+        PathKind::Retrieve => "Retr",
+        PathKind::Echo => "Echo",
     }
 }
 
@@ -159,7 +171,7 @@ pub fn run(args: ProbeArgs) -> Result<()> {
     let seeded_b = run_on(seed_log_b, &args, DEFAULT_PROMPTS)?;
 
     println!(
-        "seed={}  rng={}  p_slip={:.2}  prompts={}",
+        "seed={}  rng={}  p_slip={:.2}  mix=pool  prompts={}",
         args.seed.display(),
         args.rng_seed,
         args.p_slip,
@@ -312,9 +324,24 @@ pub fn run(args: ProbeArgs) -> Result<()> {
         format!("path={:?} text={}", ohayo.path, ohayo.text),
     );
     check(
-        "ood-markov",
-        ood.path == PathKind::Markov,
-        format!("path={:?} text={}", ood.path, ood.text),
+        "ood-closed",
+        ood.path != PathKind::Trigger,
+        format!(
+            "path={:?} text={} (no trigger for unknown topics)",
+            ood.path, ood.text
+        ),
+    );
+    let mixed = seeded
+        .rows
+        .iter()
+        .filter(|r| r.prompt != "おはよう" && r.prompt != "ありがとう")
+        .map(|r| r.n_sources)
+        .max()
+        .unwrap_or(0);
+    check(
+        "hybrid-pool",
+        mixed >= 2,
+        format!("max distinct sources on in-domain prompts={mixed}"),
     );
     check(
         "determinism",

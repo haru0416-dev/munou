@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use munou_engine::{Engine, OpenConfig, Params, PathKind, TriggerDict};
+use munou_engine::{Engine, MixMode, OpenConfig, Params, PathKind, TriggerDict};
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -21,7 +21,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn trigger_path_is_exclusive() {
+fn trigger_wins_greeting_against_echo() {
     let dir = tmp_dir("trig");
     let trig = dir.join("t.json");
     fs::write(
@@ -35,7 +35,61 @@ fn trigger_path_is_exclusive() {
     assert_eq!(r.trace.path, PathKind::Trigger);
     assert_eq!(r.text, "おはよ・テスト応答");
     assert!(r.trace.trigger.is_some());
+    assert!(
+        r.trace
+            .candidates
+            .iter()
+            .any(|c| c.source == PathKind::Echo),
+        "pool should still list echo, not XOR it away"
+    );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exclusive_trigger_skips_echo_and_markov() {
+    let dir = tmp_dir("xor");
+    let trig = dir.join("t.json");
+    fs::write(
+        &trig,
+        r#"[{"pattern":"おはよう","responses":["おはよ・テスト応答"]}]"#,
+    )
+    .unwrap();
+    let params = Params {
+        mix: MixMode::Exclusive,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 3).unwrap();
+    e.load_triggers(&trig).unwrap();
+    let r = e.respond("おはよう").unwrap();
+    assert_eq!(r.trace.path, PathKind::Trigger);
+    assert!(
+        !r.trace
+            .candidates
+            .iter()
+            .any(|c| c.source == PathKind::Markov || c.source == PathKind::Echo),
+        "exclusive XOR should not keep echo/markov beside a trigger hit"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_pool_engine_labels_echo_not_markov() {
+    let params = Params {
+        mix: MixMode::Pool,
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 1).unwrap();
+    let r = e.respond("ありがとう").unwrap();
+    assert_eq!(r.trace.path, PathKind::Echo);
+    assert_eq!(r.text, "ありがとう");
+    assert!(
+        !r.trace
+            .candidates
+            .iter()
+            .any(|c| c.source == PathKind::Markov),
+        "pool mode must not parrot the user under a Markov label"
+    );
 }
 
 #[test]
@@ -232,10 +286,10 @@ fn seed_log_grows_corpus_and_diverts_empty() {
     let empty_st = Engine::ephemeral(params.clone(), 1).unwrap().stats();
     let mut empty = Engine::ephemeral(params.clone(), 1).unwrap();
     let mut grown = Engine::open(OpenConfig {
-        params,
+        params: params.clone(),
         seed: 1,
         log_path: Some(dir.join("log.jsonl")),
-        triggers_path: Some(trig),
+        triggers_path: Some(trig.clone()),
     })
     .unwrap();
     let grown_st = grown.stats();
@@ -267,5 +321,25 @@ fn seed_log_grows_corpus_and_diverts_empty() {
 
     let hi = grown.respond("おはよう").unwrap();
     assert_eq!(hi.trace.path, PathKind::Trigger);
+    let walk = grown.respond("散歩しない？").unwrap();
+    let nsrc = walk
+        .trace
+        .candidates
+        .iter()
+        .map(|c| c.source)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    assert!(
+        nsrc >= 2,
+        "hybrid pool should mix sources; got {nsrc} path={:?} cands={}",
+        walk.trace.path,
+        walk.trace.candidates.len()
+    );
+    let ood = grown.respond("量子力学の話をしよう").unwrap();
+    assert_ne!(
+        ood.trace.path,
+        PathKind::Trigger,
+        "unknown topics must not fall into the greeting dict"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

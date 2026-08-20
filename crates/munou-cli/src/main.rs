@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use munou_engine::{Engine, OpenConfig, Params, SmoothingKind};
+use munou_engine::{Engine, MixMode, OpenConfig, Params, SmoothingKind};
 
 mod probe;
 mod verify;
@@ -101,6 +101,9 @@ struct Common {
     /// Smoothing: naive | kn
     #[arg(long)]
     smoothing: Option<String>,
+    /// Candidate mix: pool (default) | exclusive (v0.1 XOR)
+    #[arg(long)]
+    mix: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -181,6 +184,12 @@ fn params_from(c: &Common) -> Params {
         p.smoothing = match s.to_ascii_lowercase().as_str() {
             "kn" | "kneser-ney" | "kneserney" => SmoothingKind::Kn,
             _ => SmoothingKind::Naive,
+        };
+    }
+    if let Some(m) = &c.mix {
+        p.mix = match m.to_ascii_lowercase().as_str() {
+            "exclusive" | "xor" => MixMode::Exclusive,
+            _ => MixMode::Pool,
         };
     }
     p

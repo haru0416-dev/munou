@@ -2,11 +2,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::TokenId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PathKind {
     Trigger,
     Markov,
+    Retrieve,
+    Echo,
+}
+
+impl PathKind {
+    pub fn tag(self) -> &'static str {
+        match self {
+            PathKind::Trigger => "trig",
+            PathKind::Markov => "mark",
+            PathKind::Retrieve => "retr",
+            PathKind::Echo => "echo",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,8 +34,12 @@ pub struct GenStep {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateTrace {
     pub rank: usize,
+    pub source: PathKind,
     pub text: String,
     pub tokens: Vec<TokenId>,
+    /// Topic cosine before source/rote adjustments.
+    pub topic_score: f32,
+    /// Ranking score (topic ± source prior − input-LCS penalty).
     pub score: f32,
     pub chosen: bool,
 }
@@ -80,9 +97,11 @@ impl Trace {
         for c in &self.candidates {
             let mark = if c.chosen { ">" } else { " " };
             s.push_str(&format!(
-                " {mark} #{:<2} {:+.3}  {}\n",
+                " {mark} #{:<2} {:+.3} [{}] topic={:+.3}  {}\n",
                 c.rank + 1,
                 c.score,
+                c.source.tag(),
+                c.topic_score,
                 c.text
             ));
         }

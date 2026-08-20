@@ -14,8 +14,9 @@ use crate::generate::{generate_one, lcs_len};
 use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
 use crate::log::{now_ms, AppendLog, Record, Role};
-use crate::params::Params;
-use crate::select::rank_and_pick;
+use crate::mix::Pool;
+use crate::params::{MixMode, Params};
+use crate::select::{rank_and_pick, RankInput};
 use crate::smoothing::{self, Smoothing};
 use crate::store::Store;
 use crate::tokenizer::{detokenize, Tokenized, Tokenizer};
@@ -60,6 +61,8 @@ pub struct Engine {
     eval: EvalAccum,
     history: VecDeque<TokenId>,
     prior: Vec<Vec<TokenId>>,
+    /// Past bot utterances for retrieval (text + chunk ids).
+    bots: Vec<(String, Vec<TokenId>)>,
 }
 
 impl Engine {
@@ -95,12 +98,16 @@ impl Engine {
         let mut topic = TopicTracker::new(cfg.params.embed_dim, cfg.params.k_topic);
         let mut history = VecDeque::new();
         let mut prior = Vec::new();
+        let mut bots = Vec::new();
         let dim = cfg.params.embed_dim;
 
         for rec in &log.records {
             let tok = tokenizer.tokenize(&mut intern, &rec.text);
             store.push_utterance(&tok.chunks);
             prior.push(tok.chunks.clone());
+            if rec.role == Role::Bot {
+                bots.push((rec.text.clone(), tok.chunks.clone()));
+            }
             for &c in &tok.chunks {
                 history.push_back(c);
             }
@@ -128,6 +135,7 @@ impl Engine {
             eval: EvalAccum::default(),
             history,
             prior,
+            bots,
         })
     }
 
@@ -149,93 +157,59 @@ impl Engine {
 
         let trigger_hit = self.triggers.match_one(&self.embedder, input, &self.params);
 
-        let mut texts: Vec<String> = Vec::new();
-        let mut toks: Vec<Vec<TokenId>> = Vec::new();
+        let mut pool = Pool::default();
         let mut steps = Vec::new();
-        let mut path = PathKind::Markov;
         let mut trigger_tr = None;
 
         if let Some((tr, responses)) = trigger_hit {
-            path = PathKind::Trigger;
             trigger_tr = Some(tr);
             for r in responses {
-                if r.trim().is_empty() {
-                    continue;
-                }
                 let tk = self.tokenizer.tokenize(&mut self.intern, &r);
-                texts.push(r);
-                toks.push(tk.chunks);
+                pool.push(PathKind::Trigger, r, tk.chunks);
             }
         }
 
-        if texts.is_empty() {
-            path = PathKind::Markov;
-            // Longest-match context is recent history plus the current user chunks.
-            let mut ctx_seed: Vec<TokenId> = self.history.iter().copied().collect();
-            ctx_seed.extend_from_slice(&tok.chunks);
-            let parrot = tok.chunks.clone();
-            let mut seen = FxHashSet::default();
-            let mut attempts = 0;
-            while texts.len() < self.params.n_cand && attempts < self.params.n_cand * 4 {
-                attempts += 1;
-                let g = generate_one(
-                    &self.store,
-                    self.smoothing.as_ref(),
-                    &self.params,
-                    &ctx_seed,
-                    &parrot,
-                    &mut self.rng,
-                );
-                if g.tokens.is_empty() {
-                    continue;
-                }
-                let key = g.tokens.clone();
-                if !seen.insert(key) {
-                    continue;
-                }
-                let chunk_strs: Vec<String> = g
-                    .tokens
-                    .iter()
-                    .copied()
-                    .filter(|id| !is_special(*id))
-                    .map(|id| self.intern.get(id).to_string())
-                    .collect();
-                let text = detokenize(&chunk_strs);
-                if text.trim().is_empty() {
-                    continue;
-                }
-                if steps.is_empty() {
-                    steps = g.steps;
-                }
-                toks.push(g.tokens);
-                texts.push(text);
+        let exclusive_skip_rest = self.params.mix == MixMode::Exclusive && !pool.is_empty();
+
+        if !exclusive_skip_rest {
+            if self.params.mix == MixMode::Pool {
+                self.propose_retrieve(&mut pool, input, &topic);
             }
-            if texts.is_empty() {
-                let parrot_strs: Vec<String> = tok
-                    .chunks
-                    .iter()
-                    .map(|id| self.intern.get(*id).to_string())
-                    .collect();
-                let parrot_text = detokenize(&parrot_strs);
-                let shuffled = parrot_variant(&parrot_strs, &mut self.rng);
-                texts.push(shuffled);
-                toks.push(tok.chunks.clone());
-                if parrot_text != texts[0] {
-                    texts.push(parrot_text);
-                    toks.push(tok.chunks.clone());
-                }
+            let markov_ok = self.params.mix == MixMode::Exclusive || !self.store.is_empty();
+            if markov_ok {
+                self.propose_markov(&mut pool, &tok.chunks, &mut steps);
+            }
+            if self.params.mix == MixMode::Pool {
+                self.propose_echo(&mut pool, &tok);
             }
         }
+
+        if pool.is_empty() {
+            self.propose_echo(&mut pool, &tok);
+        }
+
+        let texts = pool.texts();
+        let toks = pool.tokens();
+        let sources = pool.sources();
 
         let ranked = rank_and_pick(
             &self.embedder,
-            &topic,
-            &texts,
-            &toks,
+            RankInput {
+                topic: &topic,
+                texts: &texts,
+                tokens: &toks,
+                sources: &sources,
+                input_tokens: &tok.chunks,
+                trigger_match: trigger_tr.as_ref().map(|t| t.similarity).unwrap_or(0.0),
+            },
             &self.params,
             &mut self.rng,
         );
 
+        let path = sources
+            .get(ranked.index)
+            .copied()
+            .unwrap_or(PathKind::Markov);
         let chosen_tokens = toks.get(ranked.index).cloned().unwrap_or_default();
         let chosen_text = texts
             .get(ranked.index)
@@ -245,7 +219,7 @@ impl Engine {
             .traces
             .iter()
             .find(|c| c.chosen)
-            .map(|c| c.score)
+            .map(|c| c.topic_score)
             .unwrap_or_else(|| {
                 let mut b = vec![0.0; self.embedder.dim()];
                 self.embedder.embed(&chosen_text, &mut b);
@@ -303,7 +277,8 @@ impl Engine {
         }
         trim_history(&mut self.history, self.params.l_max_capped() * 4);
         self.prior.push(tok.chunks);
-        self.prior.push(chosen_tokens);
+        self.prior.push(chosen_tokens.clone());
+        self.bots.push((chosen_text.clone(), chosen_tokens.clone()));
         self.last_trace = Some(trace.clone());
 
         Ok(Reply {
@@ -315,6 +290,110 @@ impl Engine {
     fn tokenize_observe(&mut self, text: &str) -> Tokenized {
         self.tokenizer.observe(text);
         self.tokenizer.tokenize(&mut self.intern, text)
+    }
+
+    fn propose_markov(
+        &mut self,
+        pool: &mut Pool,
+        user_chunks: &[TokenId],
+        steps: &mut Vec<crate::explain::GenStep>,
+    ) {
+        let mut ctx_seed: Vec<TokenId> = self.history.iter().copied().collect();
+        ctx_seed.extend_from_slice(user_chunks);
+        let parrot: Vec<TokenId> = if self.params.mix == MixMode::Pool && !self.store.is_empty() {
+            Vec::new()
+        } else {
+            user_chunks.to_vec()
+        };
+        let mut seen = FxHashSet::default();
+        let mut attempts = 0;
+        let start = pool.items.len();
+        while pool.items.len() - start < self.params.n_cand && attempts < self.params.n_cand * 4 {
+            attempts += 1;
+            let g = generate_one(
+                &self.store,
+                self.smoothing.as_ref(),
+                &self.params,
+                &ctx_seed,
+                &parrot,
+                &mut self.rng,
+            );
+            if g.tokens.is_empty() {
+                continue;
+            }
+            if !seen.insert(g.tokens.clone()) {
+                continue;
+            }
+            let chunk_strs: Vec<String> = g
+                .tokens
+                .iter()
+                .copied()
+                .filter(|id| !is_special(*id))
+                .map(|id| self.intern.get(id).to_string())
+                .collect();
+            let text = detokenize(&chunk_strs);
+            if text.trim().is_empty() {
+                continue;
+            }
+            if steps.is_empty() {
+                *steps = g.steps;
+            }
+            pool.push(PathKind::Markov, text, g.tokens);
+        }
+        if self.params.mix == MixMode::Exclusive && pool.is_empty() {
+            let parrot_strs: Vec<String> = user_chunks
+                .iter()
+                .map(|id| self.intern.get(*id).to_string())
+                .collect();
+            let parrot_text = detokenize(&parrot_strs);
+            let shuffled = parrot_variant(&parrot_strs, &mut self.rng);
+            pool.push(PathKind::Markov, shuffled, user_chunks.to_vec());
+            if parrot_text != pool.items.last().map(|p| p.text.as_str()).unwrap_or("") {
+                pool.push(PathKind::Markov, parrot_text, user_chunks.to_vec());
+            }
+        }
+    }
+
+    fn propose_retrieve(&mut self, pool: &mut Pool, input: &str, topic: &[f32]) {
+        if self.bots.is_empty() || self.params.n_retrieve == 0 {
+            return;
+        }
+        let mut buf = vec![0.0f32; self.embedder.dim()];
+        let mut scored: Vec<(f32, usize)> = Vec::with_capacity(self.bots.len());
+        for (i, (text, _)) in self.bots.iter().enumerate() {
+            if text == input {
+                continue;
+            }
+            self.embedder.embed(text, &mut buf);
+            scored.push((cosine(topic, &buf), i));
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut n = 0usize;
+        for (_, i) in scored {
+            if n >= self.params.n_retrieve {
+                break;
+            }
+            let (text, toks) = self.bots[i].clone();
+            let before = pool.items.len();
+            pool.push(PathKind::Retrieve, text, toks);
+            if pool.items.len() > before {
+                n += 1;
+            }
+        }
+    }
+
+    fn propose_echo(&mut self, pool: &mut Pool, tok: &Tokenized) {
+        let parrot_strs: Vec<String> = tok
+            .chunks
+            .iter()
+            .map(|id| self.intern.get(*id).to_string())
+            .collect();
+        let parrot_text = detokenize(&parrot_strs);
+        pool.push(PathKind::Echo, parrot_text, tok.chunks.clone());
+        if self.params.n_echo >= 2 {
+            let shuffled = parrot_variant(&parrot_strs, &mut self.rng);
+            pool.push(PathKind::Echo, shuffled, tok.chunks.clone());
+        }
     }
 
     fn commit(
@@ -398,11 +477,15 @@ impl Engine {
         self.store = Store::new(self.params.merge_threshold);
         self.history.clear();
         self.prior.clear();
+        self.bots.clear();
         self.topic = TopicTracker::new(self.params.embed_dim, self.params.k_topic);
-        for (_, t) in &texts {
+        for (role, t) in &texts {
             let tok = self.tokenizer.tokenize(&mut self.intern, t);
             self.store.push_utterance(&tok.chunks);
             self.prior.push(tok.chunks.clone());
+            if *role == Role::Bot {
+                self.bots.push((t.clone(), tok.chunks.clone()));
+            }
             for &c in &tok.chunks {
                 self.history.push_back(c);
             }

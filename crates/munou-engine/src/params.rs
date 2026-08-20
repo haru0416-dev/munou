@@ -36,6 +36,22 @@ pub struct Params {
     pub smoothing: SmoothingKind,
     /// Absolute discount for Kneser-Ney.
     pub kn_discount: f64,
+    /// How candidate sources are combined.
+    pub mix: MixMode,
+    /// Max retrieved past bot utterances in the pool.
+    pub n_retrieve: usize,
+    /// Echo proposals: 1 = exact user text, 2+ adds a mild shuffle.
+    pub n_echo: usize,
+    /// Subtracted from topic cosine when the source is Echo.
+    pub echo_penalty: f32,
+    /// Subtracted × (token LCS with the *input* / candidate length). Anti-parrot.
+    pub rote_penalty: f32,
+    /// Added to topic cosine when the source is Trigger.
+    pub trigger_bonus: f32,
+    /// Extra Trigger score × pattern-input cosine (strong hits beat retrieve).
+    pub trigger_match_weight: f32,
+    /// Subtracted when the source is Retrieve (slightly prefer recombination).
+    pub retrieve_penalty: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +59,16 @@ pub struct Params {
 pub enum SmoothingKind {
     Naive,
     Kn,
+}
+
+/// Candidate mixing. `pool` is the intended architecture; `exclusive` is v0.1 XOR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MixMode {
+    /// Trigger hit replaces the pool; otherwise Markov (+ silent parrot fallback).
+    Exclusive,
+    /// Trigger, Markov, retrieve, and echo all propose; the selector picks.
+    Pool,
 }
 
 impl Default for Params {
@@ -65,6 +91,14 @@ impl Default for Params {
             band_hi: 0.85,
             smoothing: SmoothingKind::Naive,
             kn_discount: 0.75,
+            mix: MixMode::Pool,
+            n_retrieve: 4,
+            n_echo: 1,
+            echo_penalty: 0.25,
+            rote_penalty: 0.50,
+            trigger_bonus: 0.10,
+            trigger_match_weight: 1.0,
+            retrieve_penalty: 0.20,
         }
     }
 }
