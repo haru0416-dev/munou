@@ -183,6 +183,33 @@ impl AppendLog {
         })
     }
 
+    /// In-memory log from JSONL text (browser/embedding entry: no
+    /// filesystem). Appends stay in memory; `export_text` round-trips.
+    pub fn from_text(text: &str) -> Self {
+        let records = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<Record>(l).ok())
+            .collect();
+        Self {
+            path: None,
+            file: None,
+            records,
+        }
+    }
+
+    /// Serialize all records as JSONL (persistence for hosts without files).
+    pub fn export_text(&self) -> String {
+        let mut out = String::new();
+        for r in &self.records {
+            if let Ok(line) = serde_json::to_string(r) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// Append a user/bot turn as two records with one write and one fsync.
     /// File contents are identical to two `append` calls and the respond path
     /// pays half the sync cost. JSONL does not make the two records atomic
@@ -217,9 +244,28 @@ impl AppendLog {
     }
 }
 
+/// Host-injected clock, milliseconds. 0 = unset (use the OS clock). wasm32
+/// has no `SystemTime`, so embeddings there must call `set_now_ms` per turn.
+static CLOCK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_now_ms(ms: u64) {
+    CLOCK_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    let o = CLOCK_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if o != 0 {
+        return o;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        0
+    }
 }

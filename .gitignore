@@ -1,4 +1,5 @@
 /target
+web/target/
 **/*.rs.bk
 .munou/
 munou-data/
@@ -8,3 +9,4 @@ munou-data/
 .vscode/
 *.swp
 .DS_Store
+.playwright-mcp/

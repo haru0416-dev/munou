@@ -58,7 +58,7 @@ pub use fabricate::{records as fabricate_records, write_jsonl as fabricate_write
 pub use generate::{lcs_len, lcsubstr_len};
 pub use ids::{is_special, special_name, TokenId, BOS, EOS, FIRST_USER, SEP};
 pub use intern::Interner;
-pub use log::{AppendLog, Record, Role};
+pub use log::{set_now_ms, AppendLog, Record, Role};
 pub use observe::{Observe, Stage};
 pub use params::{MixMode, Params, SmoothingKind};
 pub use route::{plan as route_plan, RoutePlan};

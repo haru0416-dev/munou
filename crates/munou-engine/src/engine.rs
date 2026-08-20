@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use rand_chacha::ChaCha8Rng;
@@ -118,11 +119,8 @@ impl Engine {
     }
 
     pub fn open(cfg: OpenConfig) -> Result<Self> {
-        let embedder = HashEmbedder::from_params(&cfg.params);
-        let mut tokenizer = Tokenizer::new(&cfg.params);
         let log = AppendLog::open(cfg.log_path.as_deref())?;
-
-        let mut triggers = if let Some(p) = cfg.triggers_path.as_deref() {
+        let triggers = if let Some(p) = cfg.triggers_path.as_deref() {
             if p.exists() {
                 TriggerDict::from_path(p)?
             } else {
@@ -131,6 +129,34 @@ impl Engine {
         } else {
             TriggerDict::default()
         };
+        Self::assemble(cfg.params, cfg.seed, log, triggers)
+    }
+
+    /// Filesystem-free entry (browser/embedding): replay a JSONL string;
+    /// appends stay in memory (`export_log` persists them).
+    pub fn open_from_text(params: Params, seed: u64, log_text: &str) -> Result<Self> {
+        Self::assemble(
+            params,
+            seed,
+            AppendLog::from_text(log_text),
+            TriggerDict::default(),
+        )
+    }
+
+    fn assemble(
+        params: Params,
+        seed: u64,
+        log: AppendLog,
+        mut triggers: TriggerDict,
+    ) -> Result<Self> {
+        let cfg = OpenConfig {
+            params,
+            seed,
+            log_path: None,
+            triggers_path: None,
+        };
+        let embedder = HashEmbedder::from_params(&cfg.params);
+        let mut tokenizer = Tokenizer::new(&cfg.params);
         triggers.warm(&embedder);
 
         let mut path_prior = [0.0f32; 5];
@@ -226,7 +252,19 @@ impl Engine {
         Ok(())
     }
 
+    pub fn load_triggers_json(&mut self, json: &str) -> Result<()> {
+        self.triggers = TriggerDict::from_json(json)?;
+        self.triggers.warm(&self.embedder);
+        Ok(())
+    }
+
+    /// The whole log as JSONL (persistence for hosts without files).
+    pub fn export_log(&self) -> String {
+        self.log.export_text()
+    }
+
     pub fn respond(&mut self, input: &str) -> Result<Reply> {
+        #[cfg(not(target_arch = "wasm32"))]
         let t0 = Instant::now();
         self.gen_caches.trim();
         self.gen_caches_rev.trim();
@@ -404,7 +442,16 @@ impl Engine {
             learn_roll,
             p_learn: self.params.p_learn,
             steps,
-            elapsed_us: t0.elapsed().as_micros(),
+            elapsed_us: {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    t0.elapsed().as_micros()
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    0
+                }
+            },
             novelty_lcs,
             similarity: sim,
             band_hit,

@@ -1,0 +1,24 @@
+[package]
+name = "munou-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+# Deliberately outside the workspace: keeps wasm-side dependencies out of the
+# root Cargo.lock (the closed-deps allowlist covers the engine, not this leaf).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+munou-engine = { path = "../crates/munou-engine" }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

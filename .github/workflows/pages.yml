@@ -1,0 +1,42 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.96.1 --profile minimal --target wasm32-unknown-unknown
+      - run: cargo build --release --target wasm32-unknown-unknown
+        working-directory: web
+      - run: |
+          mkdir -p _site
+          cp web/site/index.html web/site/app.js _site/
+          cp web/target/wasm32-unknown-unknown/release/munou_web.wasm _site/
+          cp data/seed.jsonl data/triggers.example.json _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
