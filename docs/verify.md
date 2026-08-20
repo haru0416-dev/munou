@@ -486,6 +486,33 @@ spec の trigger 系 2 テストと verify の trigger 検査は「既定 p_slip
   スナップ経由と再生経由で浮動小数の加算順まで一致する根拠
 - rand 系: なし。新依存: なし（スナップ形式は自前・後方互換は SNAP_REV で切る）
 
+## v0.1.17 メモリ第2弾（2026-08-20、出力同一）
+
+`munou stats --mem`（部品別ヒープ推計）を先に入れ、支配項を確定してから削った。
+v0.1.16 時点の 10^7 多様レジームの内訳: dedup 簿記×2 = 121MB / stream×2 = 133MB /
+entropy = 130MB / intern 22MB。
+
+| 施策 | 中身 |
+|---|---|
+| 双子ストアの簿記全廃 | 逆順側の push は前向き側の (idx, is_new) で駆動（2 ストアは常にロックステップ）。多重度 Vec\<u32\> のみ保持し、Arc も utt_index も作らない。rev.dedup 60.3→4.0MB |
+| 本体 utts の分離 | Arc 列を counts: Vec\<u32\> に。トークン列は流れ（text/buf + offsets）から読む `utt_tokens`。Arc は索引キーの 1 本だけに。store.dedup 60.3→40.3MB |
+| entropy 地図統合 | fwd/bwd 2 地図 → 1 地図（値 = 両方向の後続表）。ほぼ全 gram が両側を持つためキー 16B+制御を共有。未参照の count フィールドも削除。130→106MB |
+| スナップ読込の流し込み | 全エントリを Vec に集めてから挿す→1 件ずつ挿す。読込時ピークとアロケータ残滓を削減 |
+
+実測（release・このマシン）:
+- 10^7 多様: 常駐 **548 → 429MB**、スナップ読込 2.2 → **1.4–1.6s**、スナップ 87→68MB
+- 40万発話: 常駐 **143 → 109MB**、話しかけ可能まで 0.33 → **0.21s**、スナップ 22.8→17.2MB
+- verify 全 PASS（sa-is 1.52s / latency-p99 544µs / grown-p99 1.9ms / tokenize 85MB/s）、
+  probe 全 PASS、テスト 141 本、転写 diff は v0.1.15 基準と**同一**（quit 行のみ新規）
+- 予算 256MB@10^7: 反復レジーム PASS（~7MB）のまま、多様レジームは 429MB で未達。
+  残る支配項と次のレバー: stream×2 の導出配列（pos_utt+wprefix = 8B/位置。wprefix の
+  遅延再構築が O(N) なので置換には再構築戦略ごと要再設計）、entropy 出現 1 回文脈の
+  決定的剪定（応答列変更クラス）、intern のアリーナ化。RSS と推計の差 ~120MB は
+  読込・構築時の一時確保をアロケータが保持する分（malloc_trim は依存追加になるため不採用）
+
+SNAP_REV=2（形式変更: entropy 統合エントリ、count 削除）。twin 駆動の不変条件は
+`register_twin` の debug_assert（idx ロックステップ）と既存の flat-stream 参照テストが固定。
+
 ## 検証コマンドの読み方
 
 ```

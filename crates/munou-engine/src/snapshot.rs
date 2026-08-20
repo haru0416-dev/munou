@@ -19,7 +19,7 @@ use crate::ids::TokenId;
 
 /// Bump on ANY change that alters replay outcomes for the same params
 /// (tokenizer, store semantics, replay order, …). Release checklist item.
-pub(crate) const SNAP_REV: u32 = 1;
+pub(crate) const SNAP_REV: u32 = 2;
 const MAGIC: &[u8; 4] = b"MNSN";
 /// Logs smaller than this open in milliseconds anyway; skip the file churn.
 pub(crate) const MIN_LOG_BYTES: u64 = 4096;

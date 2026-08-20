@@ -42,6 +42,9 @@ enum Command {
     Stats {
         #[command(flatten)]
         common: Common,
+        /// Component heap breakdown (capacity estimate; RSS is the truth).
+        #[arg(long)]
+        mem: bool,
     },
     /// Print the raising window (gauges from log + eval). Adapters are out of scope.
     Observe {
@@ -217,13 +220,16 @@ fn main() -> Result<()> {
             text,
             explain,
         } => say(common, &text, explain),
-        Command::Stats { common } => {
+        Command::Stats { common, mem } => {
             let e = open(common)?;
             let s = e.stats();
             println!(
                 "utterances={} learned={} tokens={} vocab={} buf={} topic_k={} meta={} hist={}",
                 s.utterances, s.learned, s.tokens, s.vocab, s.buf, s.topic_window, s.meta, s.hist
             );
+            if mem {
+                print!("{}", e.mem_report());
+            }
             Ok(())
         }
         Command::Observe { common, format } => {

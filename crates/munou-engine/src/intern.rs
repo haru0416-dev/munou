@@ -82,6 +82,18 @@ mod tests {
     }
 }
 
+impl Interner {
+    /// Estimated heap bytes (strings counted once — Arc shared by map key).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mut b = self.to_str.capacity() * std::mem::size_of::<Arc<str>>()
+            + self.to_id.capacity() * (std::mem::size_of::<(Arc<str>, u32)>() + 1);
+        for s in &self.to_str {
+            b += 16 + s.len();
+        }
+        b
+    }
+}
+
 /// Snapshot used when serialising an on-disk index.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InternerSnap {

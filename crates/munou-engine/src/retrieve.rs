@@ -40,6 +40,14 @@ impl BotStore {
     /// embeddings — one embed per distinct text (the log repeats lines
     /// heavily; the embedder is deterministic). Called once at the end of
     /// open / retokenize.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mut b = self.items.capacity() * std::mem::size_of::<BotUtterance>();
+        for it in &self.items {
+            b += it.text.capacity() + it.toks.capacity() * 4 + it.emb.capacity() * 4;
+        }
+        b
+    }
+
     /// Snapshot payload: the retained window without embeddings (re-embedded
     /// on load; same embedder, same values).
     pub(crate) fn snap_items(&self) -> impl Iterator<Item = (&str, &[TokenId])> + '_ {

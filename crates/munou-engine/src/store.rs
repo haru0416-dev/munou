@@ -61,10 +61,13 @@ pub struct Store {
     pub sa: Vec<u32>,
     /// Pending dedup stream: new distinct utterances awaiting a merge.
     pub buf: Vec<TokenId>,
-    /// Distinct utterances (unwrapped chunks) with multiplicities, in first-
-    /// appearance order. The Arc is shared with the index key.
-    utts: Vec<(Arc<[TokenId]>, u32)>,
-    utt_index: FxHashMap<Arc<[TokenId]>, usize>,
+    /// Multiplicity per distinct utterance, first-appearance order. The
+    /// token sequences live only in the streams (`text` / `buf`) — see
+    /// `utt_tokens`; a twin store (reversed stream) carries no index at all.
+    counts: Vec<u32>,
+    /// Dedup lookup, owning the only Arc per distinct utterance. Empty on
+    /// twin stores: their pushes arrive pre-deduplicated (`*_twin`).
+    utt_index: FxHashMap<Arc<[TokenId]>, u32>,
     /// Start offsets in `text` of the first `committed` distinct utterances.
     offsets: Vec<u32>,
     /// Utterance index per committed text position (position → distinct utt).
@@ -136,12 +139,30 @@ impl Store {
 
     /// Append one utterance (already interned chunks). A repeat of a known
     /// utterance only bumps its multiplicity — the SA never sees it.
-    pub fn push_utterance(&mut self, chunks: &[TokenId]) {
+    pub fn push_utterance(&mut self, chunks: &[TokenId]) -> (u32, bool) {
+        if chunks.is_empty() {
+            return (0, false);
+        }
+        let had_prev = self.total_utts > 0;
+        let (idx, is_new) = self.register(chunks);
+        self.bump_stats(chunks, had_prev);
+        self.invalidate_unigram_caches();
+        if self.buf.len() >= self.merge_threshold {
+            self.merge();
+        } else if self.wprefix_stale {
+            self.refresh_wprefix();
+        }
+        (idx, is_new)
+    }
+
+    /// Twin push: the forward store already resolved (idx, is_new), so the
+    /// twin keeps no index and allocates no Arc — just counts and streams.
+    pub(crate) fn push_utterance_twin(&mut self, chunks: &[TokenId], idx: u32, is_new: bool) {
         if chunks.is_empty() {
             return;
         }
         let had_prev = self.total_utts > 0;
-        self.register(chunks);
+        self.register_twin(chunks, idx, is_new);
         self.bump_stats(chunks, had_prev);
         self.invalidate_unigram_caches();
         if self.buf.len() >= self.merge_threshold {
@@ -154,19 +175,83 @@ impl Store {
     /// Append without stat bumps or merging. For log replay only: no lookups
     /// happen until the single final `merge`, whose recompute makes the end
     /// state identical to per-utterance pushes.
-    pub(crate) fn push_utterance_deferred(&mut self, chunks: &[TokenId]) {
+    pub(crate) fn push_utterance_deferred(&mut self, chunks: &[TokenId]) -> (u32, bool) {
+        if chunks.is_empty() {
+            return (0, false);
+        }
+        let r = self.register(chunks);
+        self.stats_dirty = true;
+        self.invalidate_unigram_caches();
+        r
+    }
+
+    /// See `push_utterance_twin`.
+    pub(crate) fn push_utterance_deferred_twin(
+        &mut self,
+        chunks: &[TokenId],
+        idx: u32,
+        is_new: bool,
+    ) {
         if chunks.is_empty() {
             return;
         }
-        self.register(chunks);
+        self.register_twin(chunks, idx, is_new);
         self.stats_dirty = true;
         self.invalidate_unigram_caches();
+    }
+
+    /// Estimated heap bytes (capacities, not lengths): (stream+SA side,
+    /// dedup bookkeeping side). Gauge for `stats --mem`; RSS is the truth.
+    pub(crate) fn heap_bytes(&self) -> (usize, usize) {
+        let wp = match &self.wprefix {
+            WPrefix::Small(v) => v.capacity() * 4,
+            WPrefix::Wide(v) => v.capacity() * 8,
+        };
+        let stream = self.text.capacity() * 4
+            + self.sa.capacity() * 4
+            + self.pos_utt.capacity() * 4
+            + self.offsets.capacity() * 4
+            + self.buf.capacity() * 4
+            + self.pending_offsets.capacity() * 4
+            + wp;
+        let mut dedup = self.counts.capacity() * 4
+            + self.utt_index.capacity() * (std::mem::size_of::<(Arc<[TokenId]>, u32)>() + 1);
+        for u in self.utt_index.keys() {
+            dedup += 16 + u.len() * 4;
+        }
+        let stats = self.unigram.capacity() * 9
+            + self.continuation.capacity() * 9
+            + self.bigrams.capacity() * 13;
+        (stream + stats, dedup)
+    }
+
+    /// Tokens of distinct utterance `i`, read from the streams (committed
+    /// from `text`, pending from `buf`), without the SEP/EOS wrapping.
+    fn utt_tokens(&self, i: usize) -> &[TokenId] {
+        if i < self.committed {
+            let lo = self.offsets[i] as usize;
+            let hi = self
+                .offsets
+                .get(i + 1)
+                .map(|&o| o as usize)
+                .unwrap_or(self.text.len());
+            &self.text[lo + 1..hi - 1]
+        } else {
+            let j = i - self.committed;
+            let lo = self.pending_offsets[j] as usize;
+            let hi = self
+                .pending_offsets
+                .get(j + 1)
+                .map(|&o| o as usize)
+                .unwrap_or(self.buf.len());
+            &self.buf[lo + 1..hi - 1]
+        }
     }
 
     /// Snapshot payload: distinct utterances with multiplicities, in
     /// first-appearance order — everything else is derived.
     pub(crate) fn dedup_entries(&self) -> impl Iterator<Item = (&[TokenId], u32)> + '_ {
-        self.utts.iter().map(|(u, c)| (&u[..], *c))
+        (0..self.counts.len()).map(|i| (self.utt_tokens(i), self.counts[i]))
     }
 
     /// Rebuild from a snapshot's dedup list. End state equals a full replay:
@@ -178,9 +263,25 @@ impl Store {
             if u.is_empty() || *c == 0 {
                 continue;
             }
-            s.push_utterance_deferred(u);
-            let i = s.utts.len() - 1;
-            s.utts[i].1 = *c;
+            let (i, _) = s.push_utterance_deferred(u);
+            s.counts[i as usize] = *c;
+            s.total_utts += u64::from(*c) - 1;
+            s.total_tokens += (u.len() + 2) * (*c as usize - 1);
+        }
+        s.merge();
+        s
+    }
+
+    /// `from_dedup` for a twin store: same list, no index built.
+    pub(crate) fn from_dedup_twin(merge_threshold: usize, utts: &[(Vec<TokenId>, u32)]) -> Self {
+        let mut s = Self::new(merge_threshold);
+        for (u, c) in utts {
+            if u.is_empty() || *c == 0 {
+                continue;
+            }
+            let i = s.counts.len() as u32;
+            s.push_utterance_deferred_twin(u, i, true);
+            s.counts[i as usize] = *c;
             s.total_utts += u64::from(*c) - 1;
             s.total_tokens += (u.len() + 2) * (*c as usize - 1);
         }
@@ -189,23 +290,44 @@ impl Store {
     }
 
     /// Dedup bookkeeping shared by both push paths.
-    fn register(&mut self, chunks: &[TokenId]) {
-        if let Some(&i) = self.utt_index.get(chunks) {
-            self.utts[i].1 += 1;
-            if i < self.committed {
+    fn register(&mut self, chunks: &[TokenId]) -> (u32, bool) {
+        let (idx, is_new) = if let Some(&i) = self.utt_index.get(chunks) {
+            self.counts[i as usize] += 1;
+            if (i as usize) < self.committed {
                 // A committed utterance's multiplicity changed; the SA-order
                 // weight prefix sums no longer match.
                 self.wprefix_stale = true;
             }
+            (i, false)
         } else {
-            let key: Arc<[TokenId]> = Arc::from(chunks);
-            let i = self.utts.len();
-            self.utts.push((key.clone(), 1));
-            self.utt_index.insert(key, i);
+            let i = self.counts.len() as u32;
+            self.counts.push(1);
+            self.utt_index.insert(Arc::from(chunks), i);
             self.pending_offsets.push(self.buf.len() as u32);
             self.buf.push(SEP);
             self.buf.extend_from_slice(chunks);
             self.buf.push(EOS);
+            (i, true)
+        };
+        self.total_utts += 1;
+        self.total_tokens += chunks.len() + 2;
+        (idx, is_new)
+    }
+
+    /// `register` with the dedup outcome supplied by the forward store.
+    fn register_twin(&mut self, chunks: &[TokenId], idx: u32, is_new: bool) {
+        if is_new {
+            debug_assert_eq!(idx as usize, self.counts.len(), "twin out of lockstep");
+            self.counts.push(1);
+            self.pending_offsets.push(self.buf.len() as u32);
+            self.buf.push(SEP);
+            self.buf.extend_from_slice(chunks);
+            self.buf.push(EOS);
+        } else {
+            self.counts[idx as usize] += 1;
+            if (idx as usize) < self.committed {
+                self.wprefix_stale = true;
+            }
         }
         self.total_utts += 1;
         self.total_tokens += chunks.len() + 2;
@@ -278,7 +400,7 @@ impl Store {
             self.text.extend_from_slice(&self.buf);
             self.buf.clear();
             self.buf.shrink_to(self.merge_threshold);
-            self.committed = self.utts.len();
+            self.committed = self.counts.len();
         }
         self.rebuild_index();
     }
@@ -312,7 +434,7 @@ impl Store {
             let mut acc = 0u32;
             v.push(0);
             for &p in &self.sa {
-                acc += self.utts[self.pos_utt[p as usize] as usize].1;
+                acc += self.counts[self.pos_utt[p as usize] as usize];
                 v.push(acc);
             }
             WPrefix::Small(v)
@@ -321,7 +443,7 @@ impl Store {
             let mut acc = 0u64;
             v.push(0);
             for &p in &self.sa {
-                acc += self.utts[self.pos_utt[p as usize] as usize].1 as u64;
+                acc += self.counts[self.pos_utt[p as usize] as usize] as u64;
                 v.push(acc);
             }
             WPrefix::Wide(v)
@@ -339,8 +461,9 @@ impl Store {
         let mut bigrams = std::mem::take(&mut self.bigrams);
         unigram.clear();
         bigrams.clear();
-        for (chunks, k) in &self.utts {
-            let k = *k;
+        for i in 0..self.counts.len() {
+            let k = self.counts[i];
+            let chunks = self.utt_tokens(i);
             *unigram.entry(SEP).or_insert(0) += k;
             *unigram.entry(EOS).or_insert(0) += k;
             for &t in chunks.iter() {
@@ -395,9 +518,9 @@ impl Store {
     }
 
     /// Multiplicity of the distinct utterance a position belongs to.
-    fn weight_at(offsets: &[u32], utts: &[(Arc<[TokenId]>, u32)], first: usize, pos: usize) -> u32 {
+    fn weight_at(offsets: &[u32], counts: &[u32], first: usize, pos: usize) -> u32 {
         let i = offsets.partition_point(|&o| o as usize <= pos);
-        utts[first + i - 1].1
+        counts[first + i - 1]
     }
 
     /// Next-token counts for an exact context: occurrences in the dedup
@@ -439,7 +562,7 @@ impl Store {
                 for &p in &self.sa[r..hi] {
                     let p = p as usize;
                     let t = self.text[p + off];
-                    let w = self.utts[self.pos_utt[p] as usize].1;
+                    let w = self.counts[self.pos_utt[p] as usize];
                     cur = match cur {
                         Some((tc, c)) if tc == t => Some((tc, c + w)),
                         Some(done) => {
@@ -482,7 +605,7 @@ impl Store {
                     let j = i + ctx.len();
                     if j < self.buf.len() {
                         let w =
-                            Self::weight_at(&self.pending_offsets, &self.utts, self.committed, i);
+                            Self::weight_at(&self.pending_offsets, &self.counts, self.committed, i);
                         *acc.entry(self.buf[j]).or_insert(0) += w;
                     }
                 }

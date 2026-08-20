@@ -63,7 +63,6 @@ fn class(c: char) -> Class {
 /// ~56B packed), 246MB at 1.5M tokens before this layout.
 #[derive(Default, Debug, Clone)]
 struct NextStats {
-    count: u32,
     n_inline: u8,
     inline: [(u32, u32); INLINE],
     /// Sorted by char — a canonical order, so the entropy float sum is
@@ -127,11 +126,8 @@ impl NextStats {
         }
     }
 
-    fn from_successors(count: u32, list: Vec<(u32, u32)>) -> Self {
-        let mut st = NextStats {
-            count,
-            ..NextStats::default()
-        };
+    fn from_successors(list: Vec<(u32, u32)>) -> Self {
+        let mut st = NextStats::default();
         if list.len() <= INLINE {
             for (i, e) in list.into_iter().enumerate() {
                 st.inline[i] = e;
@@ -172,22 +168,28 @@ fn pack(gram: &[u32]) -> u128 {
     k
 }
 
-/// (packed key, context count, successors) per entry.
-pub(crate) type EntropyEntries = Vec<(u128, u32, Vec<(u32, u32)>)>;
+/// (packed key, forward successors, backward predecessors) per entry.
+pub(crate) type EntropyEntries = Vec<(u128, Vec<(u32, u32)>, Vec<(u32, u32)>)>;
 
 /// See `EntropyModel::snap_dump`.
 pub(crate) struct EntropySnap {
     pub max_n: usize,
     pub total_chars: u64,
-    pub fwd: EntropyEntries,
-    pub bwd: EntropyEntries,
+    pub entries: EntropyEntries,
+}
+
+/// Both directions of one context. Sharing the map entry halves the key +
+/// control overhead — nearly every observed gram carries both sides.
+#[derive(Debug, Clone, Default)]
+struct Ctx {
+    fwd: NextStats,
+    bwd: NextStats,
 }
 
 /// Character n-gram statistics collected from the conversation log only.
 #[derive(Debug, Clone, Default)]
 pub struct EntropyModel {
-    fwd: FxHashMap<u128, NextStats>,
-    bwd: FxHashMap<u128, NextStats>,
+    map: FxHashMap<u128, Ctx>,
     max_n: usize,
     total_chars: u64,
 }
@@ -195,8 +197,7 @@ pub struct EntropyModel {
 impl EntropyModel {
     pub fn new(max_n: usize) -> Self {
         Self {
-            fwd: FxHashMap::default(),
-            bwd: FxHashMap::default(),
+            map: FxHashMap::default(),
             // Upper clamp is the packing width; the parameter has no CLI
             // surface and the default is 5.
             max_n: max_n.clamp(2, 6),
@@ -223,16 +224,12 @@ impl EntropyModel {
                 continue;
             }
             for i in 0..=chars.len() - n {
-                let key = pack(&chars[i..i + n]);
+                let e = self.map.entry(pack(&chars[i..i + n])).or_default();
                 if i > 0 {
-                    let be = self.bwd.entry(key).or_default();
-                    be.count = be.count.saturating_add(k);
-                    be.bump(chars[i - 1], k);
+                    e.bwd.bump(chars[i - 1], k);
                 }
-                let e = self.fwd.entry(key).or_default();
-                e.count = e.count.saturating_add(k);
                 if i + n < chars.len() {
-                    e.bump(chars[i + n], k);
+                    e.fwd.bump(chars[i + n], k);
                 }
             }
         }
@@ -242,50 +239,69 @@ impl EntropyModel {
         self.total_chars >= 256
     }
 
+    /// (contexts, spilled histograms, estimated heap bytes).
+    pub(crate) fn mem_stats(&self) -> (usize, usize, usize) {
+        let mut spill = 0usize;
+        let mut heap = self.map.capacity() * (std::mem::size_of::<(u128, Ctx)>() + 1);
+        for c in self.map.values() {
+            for st in [&c.fwd, &c.bwd] {
+                if let Some(v) = &st.spill {
+                    spill += 1;
+                    heap += 24 + v.capacity() * 8;
+                }
+            }
+        }
+        (self.map.len(), spill, heap)
+    }
+
     /// Snapshot payload. Map order is irrelevant (lookup by key only);
     /// per-context successor order is canonical and round-trips exactly.
     pub(crate) fn snap_dump(&self) -> EntropySnap {
-        let dump = |m: &FxHashMap<u128, NextStats>| {
-            m.iter()
-                .map(|(k, st)| (*k, st.count, st.successors()))
-                .collect()
-        };
         EntropySnap {
             max_n: self.max_n,
             total_chars: self.total_chars,
-            fwd: dump(&self.fwd),
-            bwd: dump(&self.bwd),
+            entries: self
+                .map
+                .iter()
+                .map(|(k, c)| (*k, c.fwd.successors(), c.bwd.successors()))
+                .collect(),
         }
     }
 
-    pub(crate) fn from_snap(s: EntropySnap) -> Self {
-        let load = |v: EntropyEntries| {
-            let mut m = FxHashMap::default();
-            for (k, count, list) in v {
-                m.insert(k, NextStats::from_successors(count, list));
-            }
-            m
-        };
+    /// Streaming load counterpart of `snap_dump`: entries insert one at a
+    /// time so the loader never holds a second full copy of the model.
+    pub(crate) fn snap_new(max_n: usize, total_chars: u64, capacity: usize) -> Self {
+        let mut map = FxHashMap::default();
+        map.reserve(capacity);
         Self {
-            fwd: load(s.fwd),
-            bwd: load(s.bwd),
-            max_n: s.max_n,
-            total_chars: s.total_chars,
+            map,
+            max_n,
+            total_chars,
         }
+    }
+
+    pub(crate) fn snap_insert(&mut self, k: u128, fwd: Vec<(u32, u32)>, bwd: Vec<(u32, u32)>) {
+        self.map.insert(
+            k,
+            Ctx {
+                fwd: NextStats::from_successors(fwd),
+                bwd: NextStats::from_successors(bwd),
+            },
+        );
     }
 
     fn right_entropy(&self, gram: &[u32]) -> f64 {
-        let Some(st) = self.fwd.get(&pack(gram)) else {
-            return 0.0;
-        };
-        st.entropy()
+        self.map
+            .get(&pack(gram))
+            .map(|c| c.fwd.entropy())
+            .unwrap_or(0.0)
     }
 
     fn left_entropy(&self, gram: &[u32]) -> f64 {
-        let Some(st) = self.bwd.get(&pack(gram)) else {
-            return 0.0;
-        };
-        st.entropy()
+        self.map
+            .get(&pack(gram))
+            .map(|c| c.bwd.entropy())
+            .unwrap_or(0.0)
     }
 
     fn cut_score(&self, chars: &[u32], i: usize) -> f64 {

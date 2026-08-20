@@ -32,9 +32,6 @@ use crate::tokenizer::{detokenize, Tokenized, Tokenizer};
 use crate::trigger::TriggerDict;
 use crate::weather;
 
-/// (packed key, context count, successors) per entropy side.
-type EntropySide = Vec<(u128, u32, Vec<(u32, u32)>)>;
-
 #[derive(Default)]
 pub struct OpenConfig {
     pub params: Params,
@@ -180,11 +177,10 @@ impl Engine {
         let es = self.tokenizer.model().snap_dump();
         w.u8(es.max_n as u8);
         w.u64(es.total_chars);
-        for side in [&es.fwd, &es.bwd] {
-            w.u64(side.len() as u64);
-            for (k, count, succ) in side {
-                w.u128(*k);
-                w.u32(*count);
+        w.u64(es.entries.len() as u64);
+        for (k, fwd, bwd) in &es.entries {
+            w.u128(*k);
+            for succ in [fwd, bwd] {
                 w.u32(succ.len() as u32);
                 for &(c, n) in succ {
                     w.u32(c);
@@ -323,32 +319,22 @@ impl Engine {
         // entropy model
         let max_n = r.u8()? as usize;
         let total_chars = r.u64()?;
-        let read_side = |r: &mut snapshot::R| -> Option<EntropySide> {
-            let n = r.u64()? as usize;
-            let mut v = Vec::with_capacity(n);
-            for _ in 0..n {
-                let k = r.u128()?;
-                let count = r.u32()?;
+        let n = r.u64()? as usize;
+        let mut model = crate::tokenizer::EntropyModel::snap_new(max_n, total_chars, n);
+        for _ in 0..n {
+            let k = r.u128()?;
+            let mut sides = [Vec::new(), Vec::new()];
+            for side in sides.iter_mut() {
                 let m = r.u32()? as usize;
-                let mut succ = Vec::with_capacity(m);
+                side.reserve_exact(m);
                 for _ in 0..m {
-                    succ.push((r.u32()?, r.u32()?));
+                    side.push((r.u32()?, r.u32()?));
                 }
-                v.push((k, count, succ));
             }
-            Some(v)
-        };
-        let fwd = read_side(&mut r)?;
-        let bwd = read_side(&mut r)?;
-        let tokenizer = Tokenizer::with_model(
-            &params,
-            crate::tokenizer::EntropyModel::from_snap(crate::tokenizer::EntropySnap {
-                max_n,
-                total_chars,
-                fwd,
-                bwd,
-            }),
-        );
+            let [fwd, bwd] = sides;
+            model.snap_insert(k, fwd, bwd);
+        }
+        let tokenizer = Tokenizer::with_model(&params, model);
         // store + reversed twin from the same dedup list
         let n = r.u64()? as usize;
         let mut utts = Vec::with_capacity(n);
@@ -363,7 +349,7 @@ impl Engine {
                 .iter()
                 .map(|(u, c)| (u.iter().rev().copied().collect(), *c))
                 .collect();
-            Store::from_dedup(params.merge_threshold, &rev)
+            Store::from_dedup_twin(params.merge_threshold, &rev)
         } else {
             Store::new(params.merge_threshold)
         };
@@ -1077,10 +1063,12 @@ impl Engine {
         self.interjects.learn(text);
         self.gen_caches.clear();
         self.gen_caches_rev.clear();
-        self.store.push_utterance(chunks);
+        let (idx, is_new) = self.store.push_utterance(chunks);
         if self.params.bidir {
             let rev: Vec<TokenId> = chunks.iter().rev().copied().collect();
-            self.rev_store.push_utterance(&rev);
+            // The twin skips dedup entirely — the forward store already
+            // resolved (idx, is_new) and the two run in lockstep.
+            self.rev_store.push_utterance_twin(&rev, idx, is_new);
         }
         if role == Role::Bot {
             self.bots.push_live(
@@ -1336,6 +1324,37 @@ impl Engine {
 
     pub fn eval_summary(&self) -> String {
         self.eval.summary(&self.params)
+    }
+
+    /// Component heap estimate (capacity-based; RSS is the truth — this
+    /// names the dominators). Lines: name, bytes.
+    pub fn mem_report(&self) -> String {
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        let (s_stream, s_dedup) = self.store.heap_bytes();
+        let (r_stream, r_dedup) = self.rev_store.heap_bytes();
+        let (ectx, espill, eheap) = self.tokenizer.model().mem_stats();
+        let mut out = String::new();
+        let mut total = 0usize;
+        let line = |name: &str, b: usize, extra: String, out: &mut String| {
+            *out += &format!("{name:<18} {:>8.1}MB  {extra}\n", mb(b));
+        };
+        line("store.stream", s_stream, String::new(), &mut out);
+        line("store.dedup", s_dedup, String::new(), &mut out);
+        line("rev.stream", r_stream, String::new(), &mut out);
+        line("rev.dedup", r_dedup, String::new(), &mut out);
+        line(
+            "entropy",
+            eheap,
+            format!("ctx={ectx} spill={espill}"),
+            &mut out,
+        );
+        line("intern", self.intern.heap_bytes(), String::new(), &mut out);
+        line("retrieve", self.bots.heap_bytes(), String::new(), &mut out);
+        line("adapt", self.pairs.heap_bytes(), String::new(), &mut out);
+        total += s_stream + s_dedup + r_stream + r_dedup + eheap;
+        total += self.intern.heap_bytes() + self.bots.heap_bytes() + self.pairs.heap_bytes();
+        out += &format!("{:<18} {:>8.1}MB  (推計。実測はRSS)\n", "計", mb(total));
+        out
     }
 
     /// あゆみ — the one-page record of this individual: birth day, 初語,
@@ -1634,10 +1653,10 @@ fn replay_speech(
             .or_insert_with(|| tokenizer.tokenize(&mut intern, text))
             .clone();
         if *learned {
-            store.push_utterance_deferred(&tok.chunks);
+            let (idx, is_new) = store.push_utterance_deferred(&tok.chunks);
             if params.bidir {
                 let rev: Vec<TokenId> = tok.chunks.iter().rev().copied().collect();
-                rev_store.push_utterance_deferred(&rev);
+                rev_store.push_utterance_deferred_twin(&rev, idx, is_new);
             }
             if *role == Role::Bot {
                 bots.push_raw(text.to_string(), tok.chunks.clone());

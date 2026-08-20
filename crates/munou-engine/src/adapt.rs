@@ -56,6 +56,17 @@ impl PairStore {
         });
     }
 
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mut b = self.items.capacity() * std::mem::size_of::<Pair>();
+        for p in &self.items {
+            b += p.user_text.capacity()
+                + p.user_chunks.capacity() * 4
+                + p.reply_chunks.capacity() * 4
+                + p.emb.capacity() * 4;
+        }
+        b
+    }
+
     /// Snapshot payload: the retained window without embeddings.
     pub(crate) fn snap_items(&self) -> impl Iterator<Item = (&str, &[TokenId], &[TokenId])> + '_ {
         self.items.iter().map(|p| {
