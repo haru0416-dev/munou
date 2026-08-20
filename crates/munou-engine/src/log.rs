@@ -23,6 +23,14 @@ pub struct Record {
     pub slipped: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,
+    /// Whether this utterance was absorbed into the generative corpus.
+    /// Missing field (old seed logs) means learned — the file is a corpus.
+    #[serde(default = "default_learned")]
+    pub learned: bool,
+}
+
+fn default_learned() -> bool {
+    true
 }
 
 /// Append-only JSONL conversation log. The file is the source of truth;

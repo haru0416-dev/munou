@@ -75,6 +75,9 @@ enum Command {
         /// Slip injection probability (0 keeps the table readable).
         #[arg(long, default_value_t = 0.0)]
         p_slip: f64,
+        /// Live absorb probability. Probe defaults to 1 so empty-vs-seed is about the log.
+        #[arg(long, default_value_t = 1.0)]
+        p_learn: f64,
     },
 }
 
@@ -95,6 +98,9 @@ struct Common {
     /// Slip injection probability.
     #[arg(long)]
     p_slip: Option<f64>,
+    /// Probability of absorbing a live turn into the corpus (log always appends).
+    #[arg(long)]
+    p_learn: Option<f64>,
     /// Generation temperature.
     #[arg(long)]
     tau: Option<f64>,
@@ -119,8 +125,8 @@ fn main() -> Result<()> {
             let e = open(common)?;
             let s = e.stats();
             println!(
-                "utterances={} tokens={} vocab={} buf={} topic_k={}",
-                s.utterances, s.tokens, s.vocab, s.buf, s.topic_window
+                "utterances={} learned={} tokens={} vocab={} buf={} topic_k={}",
+                s.utterances, s.learned, s.tokens, s.vocab, s.buf, s.topic_window
             );
             Ok(())
         }
@@ -154,6 +160,7 @@ fn main() -> Result<()> {
             triggers,
             rng_seed,
             p_slip,
+            p_learn,
         } => {
             let triggers = triggers.or_else(|| {
                 let p = PathBuf::from("data/triggers.example.json");
@@ -164,6 +171,7 @@ fn main() -> Result<()> {
                 triggers,
                 rng_seed,
                 p_slip,
+                p_learn,
             })
         }
     }
@@ -176,6 +184,9 @@ fn params_from(c: &Common) -> Params {
     }
     if let Some(s) = c.p_slip {
         p.p_slip = s.clamp(0.0, 1.0);
+    }
+    if let Some(s) = c.p_learn {
+        p.p_learn = s.clamp(0.0, 1.0);
     }
     if let Some(t) = c.tau {
         p.tau_gen = t.max(1e-3);
@@ -251,8 +262,8 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
                 let s = e.stats();
                 writeln!(
                     stdout,
-                    "utterances={} tokens={} vocab={} buf={}",
-                    s.utterances, s.tokens, s.vocab, s.buf
+                    "utterances={} learned={} tokens={} vocab={} buf={}",
+                    s.utterances, s.learned, s.tokens, s.vocab, s.buf
                 )?;
             }
             "/eval" => writeln!(stdout, "{}", e.eval_summary())?,

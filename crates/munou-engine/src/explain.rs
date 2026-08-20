@@ -65,6 +65,9 @@ pub struct Trace {
     pub slipped: bool,
     pub slip_roll: f64,
     pub p_slip: f64,
+    pub learned: bool,
+    pub learn_roll: f64,
+    pub p_learn: f64,
     pub steps: Vec<GenStep>,
     pub elapsed_us: u128,
     pub novelty_lcs: usize,
@@ -78,6 +81,10 @@ impl Trace {
         s.push_str(&format!(
             "path={:?}  elapsed={}us  slipped={} (p_slip={:.2} roll={:.3})\n",
             self.path, self.elapsed_us, self.slipped, self.p_slip, self.slip_roll
+        ));
+        s.push_str(&format!(
+            "learned={} (p_learn={:.2} roll={:.3})\n",
+            self.learned, self.p_learn, self.learn_roll
         ));
         s.push_str(&format!(
             "morph=[{}]  chunk=[{}]\n",

@@ -112,6 +112,7 @@ fn full_slip_picks_non_top_when_multiple_candidates() {
     let params = Params {
         p_slip: 1.0,
         n_cand: 8,
+        p_learn: 1.0,
         ..Params::default()
     };
     let mut e = Engine::ephemeral(params, 11).unwrap();
@@ -341,5 +342,92 @@ fn seed_log_grows_corpus_and_diverts_empty() {
         PathKind::Trigger,
         "unknown topics must not fall into the greeting dict"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p_learn_zero_skips_corpus() {
+    let params = Params {
+        p_learn: 0.0,
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    let mut e = Engine::ephemeral(params, 1).unwrap();
+    let r = e.respond("ありがとう").unwrap();
+    assert!(!r.trace.learned);
+    e.respond("まだ覚えなくていい").unwrap();
+    let st = e.stats();
+    assert_eq!(st.tokens, 0);
+    assert_eq!(st.learned, 0);
+    assert!(st.utterances >= 4);
+}
+
+#[test]
+fn p_learn_one_absorbs_and_reopens() {
+    let dir = tmp_dir("learn");
+    let log = dir.join("log.jsonl");
+    let params = Params {
+        p_learn: 1.0,
+        p_slip: 0.0,
+        ..Params::default()
+    };
+    {
+        let mut e = Engine::open(OpenConfig {
+            params: params.clone(),
+            seed: 4,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        let r = e.respond("hello kitty").unwrap();
+        assert!(r.trace.learned);
+        assert!(e.stats().tokens > 0);
+        assert_eq!(e.stats().learned, e.stats().utterances);
+    }
+    let e2 = Engine::open(OpenConfig {
+        params,
+        seed: 4,
+        log_path: Some(log.clone()),
+        triggers_path: None,
+    })
+    .unwrap();
+    assert!(e2.stats().tokens > 0);
+    assert_eq!(e2.stats().learned, e2.stats().utterances);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn p_learn_skip_survives_reopen() {
+    let dir = tmp_dir("nolearn");
+    let log = dir.join("log.jsonl");
+    let params = Params {
+        p_learn: 0.0,
+        ..Params::default()
+    };
+    {
+        let mut e = Engine::open(OpenConfig {
+            params: params.clone(),
+            seed: 4,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        e.respond("残るけど覚えない").unwrap();
+    }
+    let raw = fs::read_to_string(&log).unwrap();
+    assert!(
+        raw.contains("\"learned\":false"),
+        "live skip must be written to JSONL: {raw}"
+    );
+    let e2 = Engine::open(OpenConfig {
+        params,
+        seed: 4,
+        log_path: Some(log.clone()),
+        triggers_path: None,
+    })
+    .unwrap();
+    assert_eq!(e2.stats().tokens, 0);
+    assert_eq!(e2.stats().learned, 0);
+    assert!(e2.stats().utterances >= 2);
     let _ = fs::remove_dir_all(&dir);
 }

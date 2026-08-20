@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rustc_hash::FxHashSet;
 
@@ -39,6 +39,7 @@ pub struct Reply {
 #[derive(Debug, Clone)]
 pub struct Stats {
     pub utterances: usize,
+    pub learned: usize,
     pub tokens: usize,
     pub vocab: usize,
     pub buf: usize,
@@ -80,7 +81,9 @@ impl Engine {
         let mut tokenizer = Tokenizer::new(&cfg.params);
         let log = AppendLog::open(cfg.log_path.as_deref())?;
         for rec in &log.records {
-            tokenizer.observe(&rec.text);
+            if rec.learned {
+                tokenizer.observe(&rec.text);
+            }
         }
 
         let triggers = if let Some(p) = cfg.triggers_path.as_deref() {
@@ -103,10 +106,12 @@ impl Engine {
 
         for rec in &log.records {
             let tok = tokenizer.tokenize(&mut intern, &rec.text);
-            store.push_utterance(&tok.chunks);
-            prior.push(tok.chunks.clone());
-            if rec.role == Role::Bot {
-                bots.push((rec.text.clone(), tok.chunks.clone()));
+            if rec.learned {
+                store.push_utterance(&tok.chunks);
+                prior.push(tok.chunks.clone());
+                if rec.role == Role::Bot {
+                    bots.push((rec.text.clone(), tok.chunks.clone()));
+                }
             }
             for &c in &tok.chunks {
                 history.push_back(c);
@@ -147,7 +152,7 @@ impl Engine {
     pub fn respond(&mut self, input: &str) -> Result<Reply> {
         let t0 = Instant::now();
         let input = input.trim();
-        let tok = self.tokenize_observe(input);
+        let tok = self.tokenizer.tokenize(&mut self.intern, input);
 
         let mut q = vec![0.0f32; self.embedder.dim()];
         self.embedder.embed(input, &mut q);
@@ -239,6 +244,9 @@ impl Engine {
             .map(|c| c.rank)
             .unwrap_or(0);
 
+        let learn_roll: f64 = self.rng.gen();
+        let learned = learn_roll < self.params.p_learn.clamp(0.0, 1.0);
+
         let trace = Trace {
             seed: self.seed,
             path,
@@ -260,6 +268,9 @@ impl Engine {
             slipped: ranked.slipped,
             slip_roll: ranked.slip_roll,
             p_slip: self.params.p_slip,
+            learned,
+            learn_roll,
+            p_learn: self.params.p_learn,
             steps,
             elapsed_us: t0.elapsed().as_micros(),
             novelty_lcs,
@@ -268,17 +279,22 @@ impl Engine {
         };
 
         self.eval.observe(&trace, chosen_tokens.len());
-        self.commit(Role::User, input, None, None)?;
-        self.commit(Role::Bot, &chosen_text, Some(ranked.slipped), Some(sim))?;
-        self.store.push_utterance(&tok.chunks);
-        self.store.push_utterance(&chosen_tokens);
+        self.commit(Role::User, input, None, None, learned)?;
+        self.commit(
+            Role::Bot,
+            &chosen_text,
+            Some(ranked.slipped),
+            Some(sim),
+            learned,
+        )?;
+        if learned {
+            self.absorb(Role::User, input, &tok.chunks);
+            self.absorb(Role::Bot, &chosen_text, &chosen_tokens);
+        }
         for &c in tok.chunks.iter().chain(chosen_tokens.iter()) {
             self.history.push_back(c);
         }
         trim_history(&mut self.history, self.params.l_max_capped() * 4);
-        self.prior.push(tok.chunks);
-        self.prior.push(chosen_tokens.clone());
-        self.bots.push((chosen_text.clone(), chosen_tokens.clone()));
         self.last_trace = Some(trace.clone());
 
         Ok(Reply {
@@ -287,9 +303,16 @@ impl Engine {
         })
     }
 
-    fn tokenize_observe(&mut self, text: &str) -> Tokenized {
+    fn absorb(&mut self, role: Role, text: &str, chunks: &[TokenId]) {
         self.tokenizer.observe(text);
-        self.tokenizer.tokenize(&mut self.intern, text)
+        if chunks.is_empty() {
+            return;
+        }
+        self.store.push_utterance(chunks);
+        self.prior.push(chunks.to_vec());
+        if role == Role::Bot {
+            self.bots.push((text.to_string(), chunks.to_vec()));
+        }
     }
 
     fn propose_markov(
@@ -402,6 +425,7 @@ impl Engine {
         text: &str,
         slipped: Option<bool>,
         score: Option<f32>,
+        learned: bool,
     ) -> Result<()> {
         self.log.append(Record {
             v: 1,
@@ -410,6 +434,7 @@ impl Engine {
             text: text.to_string(),
             slipped,
             score,
+            learned,
         })
     }
 
@@ -425,6 +450,7 @@ impl Engine {
     pub fn stats(&self) -> Stats {
         Stats {
             utterances: self.log.records.len(),
+            learned: self.log.records.iter().filter(|r| r.learned).count(),
             tokens: self.store.len(),
             vocab: self.intern.vocab_user(),
             buf: self.store.buf.len(),
@@ -463,28 +489,32 @@ impl Engine {
 
     /// Rebuild tokenizer + SA from the log (source of truth).
     pub fn retokenize_from_log(&mut self) -> Result<()> {
-        let texts: Vec<(Role, String)> = self
+        let recs: Vec<(Role, String, bool)> = self
             .log
             .records
             .iter()
-            .map(|r| (r.role, r.text.clone()))
+            .map(|r| (r.role, r.text.clone(), r.learned))
             .collect();
         self.tokenizer = Tokenizer::new(&self.params);
-        for (_, t) in &texts {
-            self.tokenizer.observe(t);
+        for (_, t, learned) in &recs {
+            if *learned {
+                self.tokenizer.observe(t);
+            }
         }
         self.intern = Interner::new();
         self.store = Store::new(self.params.merge_threshold);
         self.history.clear();
         self.prior.clear();
         self.bots.clear();
-        self.topic = TopicTracker::new(self.params.embed_dim, self.params.k_topic);
-        for (role, t) in &texts {
+        self.topic = TopicTracker::new(self.embedder.dim(), self.params.k_topic);
+        for (role, t, learned) in &recs {
             let tok = self.tokenizer.tokenize(&mut self.intern, t);
-            self.store.push_utterance(&tok.chunks);
-            self.prior.push(tok.chunks.clone());
-            if *role == Role::Bot {
-                self.bots.push((t.clone(), tok.chunks.clone()));
+            if *learned {
+                self.store.push_utterance(&tok.chunks);
+                self.prior.push(tok.chunks.clone());
+                if *role == Role::Bot {
+                    self.bots.push((t.clone(), tok.chunks.clone()));
+                }
             }
             for &c in &tok.chunks {
                 self.history.push_back(c);

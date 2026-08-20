@@ -24,6 +24,7 @@ pub struct ProbeArgs {
     pub triggers: Option<PathBuf>,
     pub rng_seed: u64,
     pub p_slip: f64,
+    pub p_learn: f64,
 }
 
 struct Row {
@@ -91,6 +92,7 @@ fn open_engine(log: PathBuf, args: &ProbeArgs, params: Params) -> Result<Engine>
 fn params(args: &ProbeArgs) -> Params {
     Params {
         p_slip: args.p_slip.clamp(0.0, 1.0),
+        p_learn: args.p_learn.clamp(0.0, 1.0),
         ..Params::default()
     }
 }
@@ -171,10 +173,11 @@ pub fn run(args: ProbeArgs) -> Result<()> {
     let seeded_b = run_on(seed_log_b, &args, DEFAULT_PROMPTS)?;
 
     println!(
-        "seed={}  rng={}  p_slip={:.2}  mix=pool  prompts={}",
+        "seed={}  rng={}  p_slip={:.2}  p_learn={:.2}  mix=pool  prompts={}",
         args.seed.display(),
         args.rng_seed,
         args.p_slip,
+        args.p_learn,
         DEFAULT_PROMPTS.len()
     );
     println!(
