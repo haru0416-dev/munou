@@ -1,15 +1,9 @@
-//! 節目 — growth marks derived purely from the log digest.
+//! 節目 — growth marks from digest crossings; counts and days, not fake
+//! emotion. A crossing is a property of adjacent records, so replay never
+//! re-fires a mark and reopening cannot lose one.
 //!
-//! Labels are counts and days, not fake emotion (same rule as the
-//! observation window). A mark fires on the turn whose appended records make
-//! the digest cross it — detected by comparing the digest before and after
-//! the append, so replaying the log never re-fires old marks and reopening
-//! cannot lose one: the crossing is a property of adjacent records.
-//!
-//! よそよそしさ: a gap of `ALOOF_GAP_DAYS` or more between speech records
-//! marks the reunion; for the next `ALOOF_SPEECH` speech records the
-//! experience dials are damped (see `weather::effective`). The state lives in
-//! the digest, so it is replay-derivable.
+//! よそよそしさ: a speech gap ≥ `ALOOF_GAP_DAYS` days damps the dials for the
+//! next `ALOOF_SPEECH` speech records (`weather::effective`).
 
 use crate::observe::LogDigest;
 use crate::weather::day_of_ms;

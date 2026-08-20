@@ -69,9 +69,8 @@ pub struct LogDigest {
     pub recent_learned_bot: std::collections::VecDeque<String>,
     /// Timestamp (ms) of the first speech record — うまれた日 for あゆみ / 節目.
     pub first_speech_t: Option<u64>,
-    /// Timestamp (ms) of the latest speech record. The 日和 day comes from
-    /// here (previous record, never the wall clock) so replies stay a pure
-    /// function of (log, seed, input).
+    /// Timestamp (ms) of the latest speech record — the 日和 day source
+    /// (never the wall clock).
     pub last_speech_t: Option<u64>,
     /// 初語 — the first learned user utterance ever absorbed.
     pub first_learned_user: Option<String>,

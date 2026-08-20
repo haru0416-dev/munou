@@ -1,15 +1,9 @@
-//! 関心 — dual-timescale chunk weights on the **log-position clock**.
+//! 関心 — dual-timescale chunk weights (熱 short, 根 long half-life) on the
+//! log-position clock, never wall time: replay rebuilds identical values.
 //!
-//! Two decays per learned chunk: 熱 (heat) with a short half-life and 根
-//! (root) with a long one. The clock is the number of absorbed tokens, not
-//! wall time, so replaying the same log always reconstructs the same values
-//! — the reproducibility contract stays a pure function of (log, seed).
-//!
-//! A chunk seen in fewer than `hearsay_min` distinct utterances is 聞きかじり
-//! (hearsay): it carries no interest weight and is skipped as a generation
-//! anchor, except on 口をつく turns (`hearsay_release`). Gate reason: a chunk
-//! absorbed once (typo, mishearing) must not anchor a reply; the release
-//! turns keep rare words reachable.
+//! 聞きかじり: chunks in fewer than `hearsay_min` distinct utterances carry
+//! no weight and cannot anchor (a one-off typo must not anchor a reply),
+//! except on 口をつく turns (`hearsay_release`).
 
 use rustc_hash::FxHashMap;
 
@@ -46,10 +40,8 @@ pub(crate) struct InterestLedger {
 }
 
 impl InterestLedger {
-    /// Absorb one learned utterance. Each distinct content chunk counts once
-    /// (repeats inside a single utterance do not double-strike — the same
-    /// rule the tokenizer uses for observe weights), then the clock advances
-    /// by the utterance length.
+    /// Absorb one learned utterance: each distinct content chunk counts once
+    /// per utterance, then the clock advances by the utterance length.
     pub fn learn(&mut self, chunks: &[TokenId], is_punct: impl Fn(TokenId) -> bool) {
         let mut seen = rustc_hash::FxHashSet::default();
         for &id in chunks {

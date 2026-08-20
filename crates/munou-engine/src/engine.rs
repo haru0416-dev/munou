@@ -233,9 +233,8 @@ impl Engine {
         let input = input.trim();
         let tok = self.tokenizer.tokenize(&mut self.intern, input);
 
-        // 日和: the day is the UTC day of the *previous* log record — never
-        // the wall clock at scoring time — so a reply stays a pure function
-        // of (log, seed, input) and replays reproduce the same weather.
+        // 日和: the day comes from the previous record's t, never the wall
+        // clock — a reply stays a pure function of (log, seed, input).
         let day = self.digest.last_speech_t.map(weather::day_of_ms);
         let wthr = if self.params.weather {
             day.map(|d| weather::day_weather(self.seed, d))
@@ -245,8 +244,8 @@ impl Engine {
         };
         let aloof = self.digest.aloof_left > 0;
         let gains = weather::effective(wthr, aloof);
-        // 口をつく: one draw per turn, before the sources (the RNG
-        // consumption order is part of the reproducibility contract).
+        // 口をつく: one draw per turn, before the sources (RNG order is
+        // contractual).
         let release_roll: f64 = crate::rng::rand_f64(&mut self.rng);
         let release = release_roll < (self.params.hearsay_release * gains.release).clamp(0.0, 1.0);
         let care = day.and_then(|d| self.care_word(d));
@@ -347,9 +346,8 @@ impl Engine {
         let learn_roll: f64 = crate::rng::rand_f64(&mut self.rng);
         let learned = learn_roll < self.params.p_learn.clamp(0.0, 1.0);
 
-        // 合いの手: RNG consumption is fixed — one roll when the bank is
-        // live, one pick when the roll fires. Replies of ≤4 chars skip it
-        // (an interjection before an interjection-length reply doubles up).
+        // 合いの手: one roll when the bank is live, one pick when it fires.
+        // Replies of ≤4 chars skip it.
         let interject = if self.params.interject_rate > 0.0
             && self.interjects.distinct() >= crate::interject::MIN_DISTINCT
         {
@@ -593,13 +591,10 @@ impl Engine {
             }
         }
 
-        // Exact self-repeats of the newest three replies are dropped
-        // outright: the soft penalty ranks them down, but when a whole pool
-        // scores badly the least-bad repeat still wins. Only three, not the
-        // full window — a hard ban over all of `self_window` drops the
-        // seed-scale band 67→42%; the soft penalty covers the rest. Triggers
-        // are exempt: dictionary responses are expected to repeat. The
-        // fallbacks below refill an emptied pool.
+        // Exact self-repeats of the newest three replies are dropped: with
+        // a bad pool the least-bad repeat otherwise wins. Not the full
+        // window — that drops seed-scale band 67→42%. Triggers are exempt;
+        // the fallbacks below refill an emptied pool.
         if self.params.self_window > 0 && self.params.self_penalty > 0.0 {
             pool.items.retain(|p| {
                 p.source == PathKind::Trigger
@@ -728,10 +723,7 @@ impl Engine {
     }
 
     /// Rarest in-corpus content chunk of the input; ties go to the later
-    /// position (fresher topic). None when nothing usable is in the corpus.
-    /// 聞きかじり (heard in fewer than `hearsay_min` utterances) does not
-    /// anchor — a one-off typo must not anchor a reply — except on
-    /// 口をつく turns (`release`), when it may slip out.
+    /// position (fresher topic). 聞きかじり does not anchor unless `release`.
     fn pick_anchor(&self, user_chunks: &[TokenId], release: bool) -> Option<TokenId> {
         if !self.params.bidir || self.store.is_empty() || self.rev_store.is_empty() {
             return None;
@@ -1296,9 +1288,8 @@ mod tests {
 
     #[test]
     fn different_seeds_can_diverge() {
-        // weather=false: the 日和 dials depend on the current UTC day, so a
-        // fixed seed pair can coincide on some days. This test targets the
-        // seed-split of the RNG stream and must be date-free.
+        // weather=false + p_slip=1: 日和 depends on the UTC day and a fixed
+        // seed pair can coincide on some days; this test must be date-free.
         let params = Params {
             weather: false,
             p_slip: 1.0,
@@ -1802,8 +1793,7 @@ mod tests {
     /// live (three distinct short learned lines) at rate 1.
     #[test]
     fn interject_beat_fires_and_matches_between_same_seeds() {
-        // weather=false: on a しめり day the dial scales rate 1.0 down to 0.4
-        // and the firing assertion becomes date-dependent.
+        // weather=false: a しめり day scales rate 1.0 to 0.4 (date-dependent).
         let params = Params {
             p_learn: 1.0,
             p_slip: 0.0,

@@ -1,15 +1,9 @@
-//! 日和 — the day's condition, a deterministic function of (seed, day).
+//! 日和 — deterministic per-day dials from (seed, day). The day is the UTC
+//! day of the **previous log record's t**, never the wall clock: a reply
+//! stays a pure function of (log, seed, input).
 //!
-//! The day comes from the **previous log record's timestamp**, never from the
-//! wall clock at scoring time, so a reply stays a pure function of
-//! (log, seed, input): replaying the same log through the same seed gives the
-//! same weather. The day is the UTC day number (t_ms / 86_400_000) — no
-//! timezone dependency, same result on any machine.
-//!
-//! 特徴のある日和は2日続けない: 素の抽選で前日と同じ特殊日和を引いたら
-//! 「なぎ」に落とす。14% 程度の日和でも抽選だけだと2〜3日並ぶことは普通に
-//! 起きて、観察する側には「ずっと同じ」に見える（知覚上のストリークは
-//! バグに見える）。前日も同じ式で引けるので決定論は保たれる。
+//! 特殊日和は2日続けない — 14% でも素の抽選では2〜3日並び、観察側には
+//! 「ずっと同じ」に見える。前日も同じ式で引けるので決定論は保たれる。
 
 /// One day's condition: multipliers over the experience dials.
 #[derive(Debug, Clone, Copy, PartialEq)]

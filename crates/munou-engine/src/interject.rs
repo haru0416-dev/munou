@@ -1,11 +1,7 @@
-//! 合いの手 — 返答の前に出す、学習済みの短い一行。
-//!
-//! 固定テーブルは持たない。自ログの学習済み短発話（≤ `MAX_CHARS` 文字）を
-//! 頻度つきで収穫し、その分布から引く（§2 閉世界: 素材は自ログのみ）。
-//!
-//! Constraints: display only — a verbatim copy of an already-learned line,
-//! neither logged nor re-absorbed, so replay is unchanged. Exempt from the
-//! self-repetition penalty, like triggers.
+//! 合いの手 — 返答の前に出す学習済みの短い一行。自ログの短発話（≤ `MAX_CHARS`
+//! 文字）を頻度つきで収穫し、その分布から引く（§2: 素材は自ログのみ）。
+//! 表示専用 — ログに書かず吸収もしない（replay 不変）。自己反復ペナルティの
+//! 対象外（トリガーと同じ扱い）。
 
 use rand_core::Rng;
 
