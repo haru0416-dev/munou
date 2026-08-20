@@ -397,7 +397,7 @@ impl Observe {
             100.0 * self.absorb_rate
         ));
         s.push_str(&format!(
-            "語彙 {}  {:>3}  (満タン目安 200)\n",
+            "語彙 {}  {:>3}  (バー上限 200)\n",
             bar(self.vocab_frac(), 20),
             self.vocab
         ));
