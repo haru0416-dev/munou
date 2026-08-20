@@ -136,16 +136,15 @@ impl Smoothing for KneserNey {
         let _ = n1plus;
         let lambda =
             (self.d1 * n1 as f64 + self.d2 * n2 as f64 + self.d3 * n3p as f64) / total as f64;
-        let mut out: Vec<(TokenId, f64)> = Vec::new();
-        let mut seen = rustc_hash::FxHashSet::default();
+        let mut out: Vec<(TokenId, f64)> = Vec::with_capacity(local.len() + backoff.len());
+        let bmap = backoff_values_for(local, backoff);
         for &(id, c) in local {
-            let p =
-                ((c as f64 - self.d_of(c)).max(0.0) / total as f64) + lambda * lookup(backoff, id);
+            let p_b = bmap.get(&id).copied().unwrap_or(0.0);
+            let p = ((c as f64 - self.d_of(c)).max(0.0) / total as f64) + lambda * p_b;
             out.push((id, p.max(0.0)));
-            seen.insert(id);
         }
         for &(id, p_b) in backoff {
-            if !seen.contains(&id) {
+            if !bmap.contains_key(&id) {
                 out.push((id, lambda * p_b));
             }
         }
@@ -159,12 +158,20 @@ impl Smoothing for KneserNey {
     }
 }
 
-fn lookup(backoff: &[(TokenId, f64)], id: TokenId) -> f64 {
-    backoff
-        .iter()
-        .find(|(t, _)| *t == id)
-        .map(|(_, p)| *p)
-        .unwrap_or(0.0)
+/// Backoff probabilities restricted to ids present in `local`, so the mix
+/// avoids an O(|local|·|backoff|) linear search. Same values as before.
+fn backoff_values_for(
+    local: &[(TokenId, u32)],
+    backoff: &[(TokenId, f64)],
+) -> rustc_hash::FxHashMap<TokenId, f64> {
+    let locals: rustc_hash::FxHashSet<TokenId> = local.iter().map(|(id, _)| *id).collect();
+    let mut m = rustc_hash::FxHashMap::default();
+    for &(id, p) in backoff {
+        if locals.contains(&id) {
+            m.insert(id, p);
+        }
+    }
+    m
 }
 
 fn mix(
@@ -173,15 +180,15 @@ fn mix(
     lambda: f64,
     backoff: &[(TokenId, f64)],
 ) -> Vec<(TokenId, f64)> {
-    let mut out: Vec<(TokenId, f64)> = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut out: Vec<(TokenId, f64)> = Vec::with_capacity(local.len() + backoff.len());
+    let bmap = backoff_values_for(local, backoff);
     for &(id, c) in local {
-        let p = lambda * (c as f64 / total as f64) + (1.0 - lambda) * lookup(backoff, id);
+        let p_b = bmap.get(&id).copied().unwrap_or(0.0);
+        let p = lambda * (c as f64 / total as f64) + (1.0 - lambda) * p_b;
         out.push((id, p));
-        seen.insert(id);
     }
     for &(id, p_b) in backoff {
-        if !seen.contains(&id) {
+        if !bmap.contains_key(&id) {
             out.push((id, (1.0 - lambda) * p_b));
         }
     }

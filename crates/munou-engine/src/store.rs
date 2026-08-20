@@ -6,6 +6,7 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::alias::AliasTable;
 use crate::ids::{TokenId, EOS, SEP};
 use crate::sais::{sa_range, suffix_array};
 
@@ -26,6 +27,23 @@ pub struct Store {
     bigram_n3: u64,
     bigram_n4: u64,
     merge_threshold: usize,
+    /// Lazily rebuilt copies of `ml_unigram` / `continuation_unigram`.
+    /// Invalidated on any corpus mutation; identical values to the uncached fns.
+    ml_cache: Option<Vec<(TokenId, f64)>>,
+    cont_cache: Option<Vec<(TokenId, f64)>>,
+    /// id→prob map and alias table over the cached unigram, for O(1) tail
+    /// sampling in the sparse generation path.
+    ml_aux: Option<(FxHashMap<TokenId, f64>, AliasTable)>,
+    cont_aux: Option<(FxHashMap<TokenId, f64>, AliasTable)>,
+}
+
+/// Borrowed view of the cached sampling unigram: the id-sorted distribution,
+/// an id→prob map, and an alias table for O(1) draws from the full unigram.
+#[derive(Clone, Copy)]
+pub struct SamplingUnigram<'a> {
+    pub dist: &'a [(TokenId, f64)],
+    pub map: &'a FxHashMap<TokenId, f64>,
+    pub alias: &'a AliasTable,
 }
 
 impl Store {
@@ -60,6 +78,7 @@ impl Store {
             let start = self.buf.len().saturating_sub(chunks.len() + 2);
             let slice = self.buf[start..].to_vec();
             self.bump_unigram_slice(&slice);
+            self.invalidate_unigram_caches();
         }
     }
 
@@ -84,6 +103,7 @@ impl Store {
     }
 
     fn recompute_stats(&mut self) {
+        self.invalidate_unigram_caches();
         self.unigram.clear();
         self.continuation.clear();
         self.bigram_n1 = 0;
@@ -139,23 +159,112 @@ impl Store {
     }
 
     /// Next-token counts for an exact context, combining SA body and buffer.
+    ///
+    /// Inside the SA range all suffixes share `ctx`, so they are ordered by the
+    /// token at offset `ctx.len()`; distinct next tokens form contiguous runs
+    /// whose ends are found by binary search — O(distinct·log occ), not O(occ).
     pub fn next_counts(&self, ctx: &[TokenId]) -> (Vec<(TokenId, u32)>, u32) {
-        let mut acc: FxHashMap<TokenId, u32> = FxHashMap::default();
-        if !ctx.is_empty() {
-            if let Some((lo, hi)) = sa_range(&self.text, &self.sa, ctx) {
-                for r in lo..hi {
-                    let pos = sa_pos(self.sa[r], ctx.len(), self.text.len());
-                    if let Some(tok) = pos.and_then(|p| self.text.get(p).copied()) {
-                        *acc.entry(tok).or_insert(0) += 1;
+        if ctx.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let mut body: Vec<(TokenId, u32)> = Vec::new();
+        if let Some((lo, hi)) = sa_range(&self.text, &self.sa, ctx) {
+            let off = ctx.len();
+            let n = self.text.len();
+            let mut r = lo;
+            // The suffix equal to `ctx` at end-of-text sorts first; it has no next token.
+            while r < hi && self.sa[r] as usize + off >= n {
+                r += 1;
+            }
+            while r < hi {
+                let t = self.text[self.sa[r] as usize + off];
+                let mut a = r + 1;
+                let mut b = hi;
+                while a < b {
+                    let m = (a + b) / 2;
+                    let p = self.sa[m] as usize + off;
+                    if p < n && self.text[p] == t {
+                        a = m + 1;
+                    } else {
+                        b = m;
                     }
                 }
+                body.push((t, (a - r) as u32));
+                r = a;
             }
-            count_linear(&self.buf, ctx, &mut acc);
+        }
+        let mut acc: FxHashMap<TokenId, u32> = FxHashMap::default();
+        count_linear(&self.buf, ctx, &mut acc);
+        if acc.is_empty() {
+            let total: u32 = body.iter().map(|(_, c)| *c).sum();
+            return (body, total);
+        }
+        for (t, c) in body {
+            *acc.entry(t).or_insert(0) += c;
         }
         let total: u32 = acc.values().copied().sum();
         let mut v: Vec<(TokenId, u32)> = acc.into_iter().collect();
         v.sort_by_key(|(id, _)| *id);
         (v, total)
+    }
+
+    fn invalidate_unigram_caches(&mut self) {
+        self.ml_cache = None;
+        self.cont_cache = None;
+        self.ml_aux = None;
+        self.cont_aux = None;
+    }
+
+    /// Cached copy of `continuation_unigram` (kn) or `ml_unigram` (naive).
+    /// Same values; rebuilt only after the corpus changed.
+    pub fn sampling_unigram(&mut self, kn: bool) -> Vec<(TokenId, f64)> {
+        self.warm_sampling(kn);
+        if kn {
+            self.cont_cache.clone().unwrap_or_default()
+        } else {
+            self.ml_cache.clone().unwrap_or_default()
+        }
+    }
+
+    /// Build the unigram caches (distribution + map + alias) if stale.
+    pub fn warm_sampling(&mut self, kn: bool) {
+        if kn {
+            if self.cont_cache.is_none() {
+                self.cont_cache = Some(self.continuation_unigram());
+            }
+            if self.cont_aux.is_none() {
+                let d = self.cont_cache.as_deref().unwrap_or(&[]);
+                self.cont_aux = Some(build_aux(d));
+            }
+        } else {
+            if self.ml_cache.is_none() {
+                self.ml_cache = Some(self.ml_unigram());
+            }
+            if self.ml_aux.is_none() {
+                let d = self.ml_cache.as_deref().unwrap_or(&[]);
+                self.ml_aux = Some(build_aux(d));
+            }
+        }
+    }
+
+    /// Borrowed view of the warmed caches. Call `warm_sampling` first;
+    /// returns `None` when the caches are stale.
+    pub fn sampling_view(&self, kn: bool) -> Option<SamplingUnigram<'_>> {
+        let (dist, aux) = if kn {
+            (self.cont_cache.as_deref()?, self.cont_aux.as_ref()?)
+        } else {
+            (self.ml_cache.as_deref()?, self.ml_aux.as_ref()?)
+        };
+        Some(SamplingUnigram {
+            dist,
+            map: &aux.0,
+            alias: &aux.1,
+        })
+    }
+
+    /// Whether the exact token run occurs anywhere in body or buffer.
+    pub fn contains_seq(&self, pat: &[TokenId]) -> bool {
+        !pat.is_empty() && occurs(self, pat)
     }
 
     pub fn unigram_counts(&self) -> Vec<(TokenId, u32)> {
@@ -211,20 +320,17 @@ impl Store {
     }
 }
 
+fn build_aux(dist: &[(TokenId, f64)]) -> (FxHashMap<TokenId, f64>, AliasTable) {
+    let map: FxHashMap<TokenId, f64> = dist.iter().copied().collect();
+    let weights: Vec<f64> = dist.iter().map(|(_, p)| *p).collect();
+    (map, AliasTable::from_weights(&weights))
+}
+
 fn occurs(store: &Store, pat: &[TokenId]) -> bool {
     if sa_range(&store.text, &store.sa, pat).is_some() {
         return true;
     }
     store.buf.windows(pat.len()).any(|w| w == pat)
-}
-
-fn sa_pos(sa_i: u32, ctx_len: usize, n: usize) -> Option<usize> {
-    let p = sa_i as usize + ctx_len;
-    if p < n {
-        Some(p)
-    } else {
-        None
-    }
 }
 
 fn count_linear(text: &[TokenId], ctx: &[TokenId], acc: &mut FxHashMap<TokenId, u32>) {

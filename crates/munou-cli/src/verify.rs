@@ -10,7 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use munou_engine::{Engine, Interner, OpenConfig, Params, PathKind, Stage, Tokenizer};
+use munou_engine::{
+    Engine, FabricateOpts, Interner, OpenConfig, Params, PathKind, Stage, Tokenizer,
+};
 
 const LOCKFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
 
@@ -426,6 +428,60 @@ pub fn run(sa_tokens: usize, turns: usize) -> Result<()> {
             format!("{gen_p99}us (budget 2ms, Markov draw only)"),
         ),
     );
+
+    // 育ったログでの応答レイテンシ。空エンジンの latency-p99 はこの経路を
+    // 見ない（語彙が育つと補間・選択のコストが跳ねる）ので、語彙が増える
+    // fabricate ログを開いて外側の時計で測る。
+    {
+        let glog = dir.join("grown-latency.jsonl");
+        let pairs = if cfg!(debug_assertions) { 500 } else { 4000 };
+        munou_engine::fabricate_write(
+            &glog,
+            FabricateOpts {
+                pairs,
+                rng_seed: 1,
+                unique_frac: 0.3,
+            },
+        )?;
+        let mut ge = Engine::open(OpenConfig {
+            params: Params::default(),
+            seed: 1,
+            log_path: Some(glog),
+            triggers_path: None,
+        })?;
+        let prompts = [
+            "おはよう",
+            "散歩しない？",
+            "眠い",
+            "ゲームしよう",
+            "コーヒー飲む？",
+            "また明日ね",
+        ];
+        for p in prompts {
+            let _ = ge.respond(p)?;
+        }
+        let mut gtimes = Vec::with_capacity(turns.max(1));
+        for i in 0..turns.max(1) {
+            let t0 = Instant::now();
+            ge.respond(prompts[i % prompts.len()])?;
+            gtimes.push(t0.elapsed().as_micros());
+        }
+        let gp99 = percentile_us(&mut gtimes);
+        let st = ge.stats();
+        check(
+            "grown-latency-p99",
+            nfr_status(gp99 <= 30_000),
+            nfr_detail(
+                gp99 <= 30_000,
+                format!(
+                    "{gp99}us over {} turns (budget 30ms; grown log vocab={} tokens={})",
+                    turns.max(1),
+                    st.vocab,
+                    st.tokens
+                ),
+            ),
+        );
+    }
 
     let blob = "あいうえおかきくけこ".repeat(20_000);
     let bytes = blob.len() as f64;

@@ -10,13 +10,13 @@ use crate::embed::{cosine, Embedder, HashEmbedder, TopicTracker};
 use crate::error::Result;
 use crate::eval::EvalAccum;
 use crate::explain::{PathKind, Trace};
-use crate::generate::{generate_one, lcsubstr_len};
+use crate::generate::{generate_one, NextMemo};
 use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
 use crate::log::{now_ms, AppendLog, Record, Role};
 use crate::mix::Pool;
 use crate::observe::Observe;
-use crate::params::{MixMode, Params};
+use crate::params::{MixMode, Params, SmoothingKind};
 use crate::route;
 use crate::select::{rank_and_pick, RankInput};
 use crate::smoothing::{self, Smoothing};
@@ -67,9 +67,9 @@ pub struct Engine {
     smoothing: Box<dyn Smoothing>,
     eval: EvalAccum,
     history: VecDeque<TokenId>,
-    prior: Vec<Vec<TokenId>>,
-    /// Past bot utterances for retrieval (text + chunk ids).
-    bots: Vec<(String, Vec<TokenId>)>,
+    /// Past bot utterances for retrieval (text + chunk ids + cached embedding).
+    /// Trimmed to the retrieve scan window when `n_retrieve_scan > 0`.
+    bots: Vec<BotUtterance>,
     /// Closed analog of RLHF: additive path prior from `/good` `/bad`.
     path_prior: [f32; 4],
     /// Last bot path, restored from the log so `/good` works after reopen.
@@ -113,8 +113,7 @@ impl Engine {
         let mut store = Store::new(cfg.params.merge_threshold);
         let mut topic = TopicTracker::new(cfg.params.embed_dim, cfg.params.k_topic);
         let mut history = VecDeque::new();
-        let mut prior = Vec::new();
-        let mut bots = Vec::new();
+        let mut bots: Vec<BotUtterance> = Vec::new();
         let dim = cfg.params.embed_dim;
 
         let mut path_prior = [0.0f32; 4];
@@ -138,6 +137,12 @@ impl Engine {
             }
         }
 
+        // Only the last k records can still be inside the topic window, so
+        // embedding every record on open is wasted work — the window state is
+        // identical either way.
+        let n_speech = log.records.iter().filter(|r| r.role != Role::Meta).count();
+        let k_topic = cfg.params.k_topic.max(1);
+        let mut speech_idx = 0usize;
         for rec in &log.records {
             if rec.role == Role::Meta {
                 continue;
@@ -145,20 +150,27 @@ impl Engine {
             let tok = tokenizer.tokenize(&mut intern, &rec.text);
             if rec.learned {
                 store.push_utterance(&tok.chunks);
-                prior.push(tok.chunks.clone());
                 if rec.role == Role::Bot {
-                    bots.push((rec.text.clone(), tok.chunks.clone()));
+                    bots.push(BotUtterance {
+                        text: rec.text.clone(),
+                        toks: tok.chunks.clone(),
+                        emb: Vec::new(),
+                    });
                 }
             }
             for &c in &tok.chunks {
                 history.push_back(c);
             }
-            let mut v = vec![0.0f32; dim];
-            embedder.embed(&rec.text, &mut v);
-            topic.push(&v);
+            if speech_idx + k_topic >= n_speech {
+                let mut v = vec![0.0f32; dim];
+                embedder.embed(&rec.text, &mut v);
+                topic.push(&v);
+            }
+            speech_idx += 1;
         }
         store.merge();
         trim_history(&mut history, cfg.params.l_max_capped() * 4);
+        finish_bots(&mut bots, &embedder, cfg.params.n_retrieve_scan);
 
         let mut eval = EvalAccum::default();
         for rec in &log.records {
@@ -182,7 +194,6 @@ impl Engine {
             smoothing,
             eval,
             history,
-            prior,
             bots,
             path_prior,
             last_path: last_bot_path,
@@ -298,12 +309,7 @@ impl Engine {
                 cosine(&topic, &b)
             });
         let band_hit = sim >= self.params.band_lo && sim <= self.params.band_hi;
-        let novelty_lcs = self
-            .prior
-            .iter()
-            .map(|u| lcsubstr_len(&chosen_tokens, u))
-            .max()
-            .unwrap_or(0);
+        let novelty_lcs = longest_corpus_run(&self.store, &chosen_tokens);
         let chosen_rank = ranked
             .traces
             .iter()
@@ -395,9 +401,15 @@ impl Engine {
             return;
         }
         self.store.push_utterance(chunks);
-        self.prior.push(chunks.to_vec());
         if role == Role::Bot {
-            self.bots.push((text.to_string(), chunks.to_vec()));
+            let mut emb = vec![0.0f32; self.embedder.dim()];
+            self.embedder.embed(text, &mut emb);
+            self.bots.push(BotUtterance {
+                text: text.to_string(),
+                toks: chunks.to_vec(),
+                emb,
+            });
+            trim_bots(&mut self.bots, self.params.n_retrieve_scan);
         }
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
     }
@@ -416,17 +428,23 @@ impl Engine {
         } else {
             user_chunks.to_vec()
         };
+        let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
+        self.store.warm_sampling(kn);
+        let mut memo = NextMemo::default();
         let mut seen = FxHashSet::default();
         let mut attempts = 0;
         let start = pool.items.len();
         while pool.items.len() - start < n_cand && attempts < n_cand.max(1) * 4 {
             attempts += 1;
+            let uni = self.store.sampling_view(kn).expect("warmed above");
             let g = generate_one(
                 &self.store,
                 self.smoothing.as_ref(),
                 &self.params,
                 &ctx_seed,
                 &parrot,
+                uni,
+                &mut memo,
                 &mut self.rng,
             );
             if g.tokens.is_empty() {
@@ -475,51 +493,59 @@ impl Engine {
         }
     }
 
-    fn propose_retrieve(&mut self, pool: &mut Pool, input: &str, topic: &[f32], n_retrieve: usize) {
+    fn propose_retrieve(&self, pool: &mut Pool, input: &str, topic: &[f32], n_retrieve: usize) {
         if self.bots.is_empty() || n_retrieve == 0 {
             return;
         }
-        let dim = self.embedder.dim();
         let lambda = self.params.mmr_lambda.clamp(0.0, 1.0);
         let start = self.bot_scan_start();
-        let mut cands: Vec<(f32, usize, Vec<f32>)> = Vec::with_capacity(self.bots.len() - start);
-        let mut buf = vec![0.0f32; dim];
-        for (i, (text, _)) in self.bots.iter().enumerate().skip(start) {
-            if text == input {
+        let mut cands: Vec<(f32, usize)> = Vec::with_capacity(self.bots.len() - start);
+        for (i, b) in self.bots.iter().enumerate().skip(start) {
+            if b.text == input {
                 continue;
             }
-            self.embedder.embed(text, &mut buf);
-            let sim = cosine(topic, &buf);
-            cands.push((sim, i, buf.clone()));
+            cands.push((cosine(topic, &b.emb), i));
         }
-        let mut picked: Vec<usize> = Vec::new();
-        while picked.len() < n_retrieve && picked.len() < cands.len() {
+        // MMR with an incrementally maintained max-redundancy per candidate:
+        // red_i = max over picked j of cos(e_i, e_j) — same value as the old
+        // per-round fold, updated in O(n) per pick instead of recomputed in
+        // O(n·k) cosines per round.
+        let mut picked_flag = vec![false; cands.len()];
+        let mut red = vec![0.0f32; cands.len()];
+        let mut n_picked = 0usize;
+        while n_picked < n_retrieve && n_picked < cands.len() {
             let mut best_i = None;
             let mut best_s = f32::NEG_INFINITY;
-            for (i, (sim, bot_i, emb)) in cands.iter().enumerate() {
-                if picked.contains(&i) {
+            for (ci, &(sim, bot_i)) in cands.iter().enumerate() {
+                if picked_flag[ci] {
                     continue;
                 }
-                if pool.items.iter().any(|p| p.text == self.bots[*bot_i].0) {
+                if pool.items.iter().any(|p| p.text == self.bots[bot_i].text) {
                     continue;
                 }
-                let red = picked
-                    .iter()
-                    .map(|&j| cosine(emb, &cands[j].2))
-                    .fold(0.0f32, f32::max);
-                let mmr = lambda * *sim - (1.0 - lambda) * red;
+                let mmr = lambda * sim - (1.0 - lambda) * red[ci];
                 if mmr > best_s {
                     best_s = mmr;
-                    best_i = Some(i);
+                    best_i = Some(ci);
                 }
             }
-            let Some(i) = best_i else {
+            let Some(ci) = best_i else {
                 break;
             };
-            picked.push(i);
-            let bot_i = cands[i].1;
-            let (text, toks) = self.bots[bot_i].clone();
-            pool.push(PathKind::Retrieve, text, toks);
+            picked_flag[ci] = true;
+            n_picked += 1;
+            let bot_i = cands[ci].1;
+            let b = &self.bots[bot_i];
+            pool.push(PathKind::Retrieve, b.text.clone(), b.toks.clone());
+            let picked_emb = &self.bots[bot_i].emb;
+            for (cj, &(_, bj)) in cands.iter().enumerate() {
+                if !picked_flag[cj] {
+                    let r = cosine(&self.bots[bj].emb, picked_emb);
+                    if r > red[cj] {
+                        red[cj] = r;
+                    }
+                }
+            }
         }
     }
 
@@ -597,11 +623,9 @@ impl Engine {
         if self.bots.is_empty() {
             return 0.0;
         }
-        let mut buf = vec![0.0f32; self.embedder.dim()];
         let mut m = 0.0f32;
-        for (text, _) in self.bots.iter().skip(self.bot_scan_start()) {
-            self.embedder.embed(text, &mut buf);
-            m = m.max(cosine(topic, &buf));
+        for b in self.bots.iter().skip(self.bot_scan_start()) {
+            m = m.max(cosine(topic, &b.emb));
         }
         m
     }
@@ -666,12 +690,18 @@ impl Engine {
     pub fn markov_draw(&mut self) -> usize {
         let ctx: Vec<TokenId> = self.history.iter().copied().collect();
         let parrot: Vec<TokenId> = ctx.iter().rev().copied().take(4).collect();
+        let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
+        self.store.warm_sampling(kn);
+        let uni = self.store.sampling_view(kn).expect("warmed above");
+        let mut memo = NextMemo::default();
         generate_one(
             &self.store,
             self.smoothing.as_ref(),
             &self.params,
             &ctx,
             &parrot,
+            uni,
+            &mut memo,
             &mut self.rng,
         )
         .tokens
@@ -696,9 +726,14 @@ impl Engine {
         self.intern = Interner::new();
         self.store = Store::new(self.params.merge_threshold);
         self.history.clear();
-        self.prior.clear();
         self.bots.clear();
         self.topic = TopicTracker::new(self.embedder.dim(), self.params.k_topic);
+        let n_speech = recs
+            .iter()
+            .filter(|(role, _, _)| *role != Role::Meta)
+            .count();
+        let k_topic = self.params.k_topic.max(1);
+        let mut speech_idx = 0usize;
         for (role, t, learned) in &recs {
             if *role == Role::Meta {
                 continue;
@@ -706,20 +741,27 @@ impl Engine {
             let tok = self.tokenizer.tokenize(&mut self.intern, t);
             if *learned {
                 self.store.push_utterance(&tok.chunks);
-                self.prior.push(tok.chunks.clone());
                 if *role == Role::Bot {
-                    self.bots.push((t.clone(), tok.chunks.clone()));
+                    self.bots.push(BotUtterance {
+                        text: t.clone(),
+                        toks: tok.chunks.clone(),
+                        emb: Vec::new(),
+                    });
                 }
             }
             for &c in &tok.chunks {
                 self.history.push_back(c);
             }
-            let mut v = vec![0.0f32; self.embedder.dim()];
-            self.embedder.embed(t, &mut v);
-            self.topic.push(&v);
+            if speech_idx + k_topic >= n_speech {
+                let mut v = vec![0.0f32; self.embedder.dim()];
+                self.embedder.embed(t, &mut v);
+                self.topic.push(&v);
+            }
+            speech_idx += 1;
         }
         self.store.merge();
         trim_history(&mut self.history, self.params.l_max_capped() * 4);
+        finish_bots(&mut self.bots, &self.embedder, self.params.n_retrieve_scan);
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
@@ -730,6 +772,61 @@ fn apply_pref(prior: &mut [f32; 4], path: PathKind, good: bool, step: f32, clip:
     let d = if good { step } else { -step };
     let clip = clip.max(0.0);
     prior[i] = (prior[i] + d).clamp(-clip, clip);
+}
+
+#[derive(Debug, Clone)]
+struct BotUtterance {
+    text: String,
+    toks: Vec<TokenId>,
+    /// Hash embedding of `text`, cached so retrieve / routing do not re-embed
+    /// the scan window every turn. Same embedder, same values.
+    emb: Vec<f32>,
+}
+
+/// Drop bots that can never enter the scan window again, then fill embeddings.
+/// Called once at the end of open / retokenize.
+fn finish_bots(bots: &mut Vec<BotUtterance>, embedder: &HashEmbedder, cap: usize) {
+    if cap > 0 && bots.len() > cap {
+        let cut = bots.len() - cap;
+        bots.drain(..cut);
+    }
+    for b in bots.iter_mut() {
+        let mut v = vec![0.0f32; embedder.dim()];
+        embedder.embed(&b.text, &mut v);
+        b.emb = v;
+    }
+}
+
+/// Amortised front-trim: entries before the last `cap` are unreachable
+/// (`bot_scan_start`), so keeping at most 2·cap preserves behaviour exactly.
+fn trim_bots(bots: &mut Vec<BotUtterance>, cap: usize) {
+    if cap > 0 && bots.len() > cap * 2 {
+        let cut = bots.len() - cap;
+        bots.drain(..cut);
+    }
+}
+
+/// Longest run of `toks` occurring anywhere in the corpus. Utterances are
+/// wrapped SEP..EOS in the store and chunk runs never contain specials, so an
+/// occurrence cannot cross an utterance boundary — this equals the previous
+/// max-over-all-prior-utterances `lcsubstr_len`, computed against the suffix
+/// array instead of re-scanning every utterance per turn.
+fn longest_corpus_run(store: &Store, toks: &[TokenId]) -> usize {
+    let mut best = 0usize;
+    for seg in toks.split(|t| is_special(*t)) {
+        let m = seg.len();
+        for i in 0..m {
+            if i + best >= m {
+                break;
+            }
+            let mut l = best + 1;
+            while i + l <= m && store.contains_seq(&seg[i..i + l]) {
+                l += 1;
+            }
+            best = best.max(l - 1);
+        }
+    }
+    best
 }
 
 fn trim_history(h: &mut VecDeque<TokenId>, cap: usize) {
