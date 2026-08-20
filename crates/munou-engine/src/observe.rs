@@ -67,6 +67,7 @@ pub struct Observe {
     pub path_retr: u32,
     pub path_mark: u32,
     pub path_echo: u32,
+    pub path_adpt: u32,
     pub path_known: u32,
     pub last_path: Option<PathKind>,
     pub last_learned: Option<bool>,
@@ -87,7 +88,7 @@ pub struct Observe {
     pub meta: usize,
     /// Generation-context token queue.
     pub hist: usize,
-    pub path_prior: [f32; 4],
+    pub path_prior: [f32; 5],
 }
 
 impl Observe {
@@ -126,6 +127,7 @@ impl Observe {
         let mut path_retr = 0u32;
         let mut path_mark = 0u32;
         let mut path_echo = 0u32;
+        let mut path_adpt = 0u32;
         for rec in records {
             if rec.role != Role::Bot {
                 continue;
@@ -135,10 +137,11 @@ impl Observe {
                 Some(PathKind::Retrieve) => path_retr += 1,
                 Some(PathKind::Markov) => path_mark += 1,
                 Some(PathKind::Echo) => path_echo += 1,
+                Some(PathKind::Adapt) => path_adpt += 1,
                 None => {}
             }
         }
-        let path_known = path_trig + path_retr + path_mark + path_echo;
+        let path_known = path_trig + path_retr + path_mark + path_echo + path_adpt;
 
         let last_bot = records.iter().rev().find(|r| r.role == Role::Bot);
         let last_path = last
@@ -199,6 +202,7 @@ impl Observe {
             path_retr,
             path_mark,
             path_echo,
+            path_adpt,
             path_known,
             last_path,
             last_learned,
@@ -308,8 +312,8 @@ impl Observe {
         if self.path_prior.iter().any(|x| *x != 0.0) {
             let pr = self.path_prior;
             s.push_str(&format!(
-                "好み  trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2}\n",
-                pr[0], pr[1], pr[2], pr[3]
+                "好み  trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2} adpt={:+.2}\n",
+                pr[0], pr[1], pr[2], pr[3], pr[4]
             ));
         }
         s.push('\n');
@@ -353,8 +357,8 @@ impl Observe {
             s.push_str("経路  未記録（旧ログに path なし）\n");
         } else {
             s.push_str(&format!(
-                "経路  trig={} retr={} mark={} echo={}\n",
-                self.path_trig, self.path_retr, self.path_mark, self.path_echo
+                "経路  trig={} retr={} mark={} echo={} adpt={}\n",
+                self.path_trig, self.path_retr, self.path_mark, self.path_echo, self.path_adpt
             ));
         }
         if let Some(why) = &self.last_why {
@@ -398,8 +402,8 @@ impl Observe {
             "未記録（旧ログに path なし）".into()
         } else {
             format!(
-                "trig={} retr={} mark={} echo={}",
-                self.path_trig, self.path_retr, self.path_mark, self.path_echo
+                "trig={} retr={} mark={} echo={} adpt={}",
+                self.path_trig, self.path_retr, self.path_mark, self.path_echo, self.path_adpt
             )
         };
         let last = self.last_why.as_deref().unwrap_or("（まだ応答なし）");
@@ -464,8 +468,8 @@ ul {{ padding-left: 1.2rem; }}
                 let pr = self.path_prior;
                 if pr.iter().any(|x| *x != 0.0) {
                     format!(
-                        "　好み trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2}",
-                        pr[0], pr[1], pr[2], pr[3]
+                        "　好み trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2} adpt={:+.2}",
+                        pr[0], pr[1], pr[2], pr[3], pr[4]
                     )
                 } else {
                     String::new()
@@ -563,7 +567,7 @@ mod tests {
             episodic: utterances,
             meta: 0,
             hist: 0,
-            path_prior: [0.0; 4],
+            path_prior: [0.0; 5],
         }
     }
 

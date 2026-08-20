@@ -74,6 +74,18 @@ pub struct Params {
     pub trigger_match_weight: f32,
     /// Subtracted when the source is Retrieve (slightly prefer recombination).
     pub retrieve_penalty: f32,
+    /// Subtracted when the source is Adapt (modified copy sits between
+    /// Markov recombination and Retrieve verbatim).
+    pub adapt_penalty: f32,
+    /// Max Adapt proposals: 1 = adapted reply, 2 = + a quoted past user line.
+    pub n_adapt: usize,
+    /// Keyword-anchored bidirectional generation (MegaHAL analog) on a
+    /// reversed-stream twin store. Costs a second SA (memory and merge time
+    /// roughly double on the store side).
+    pub bidir: bool,
+    /// Experimental selection term: score += weight × mean −ln p of the
+    /// candidate's generation steps. 0 = record surprise in /why only.
+    pub surprise_weight: f32,
     /// MMR λ for retrieve: λ·sim − (1−λ)·max redundancy. 1 = top-k cosine.
     pub mmr_lambda: f32,
     /// Nucleus mass `p`. 1 = keep the full distribution.
@@ -140,6 +152,10 @@ impl Default for Params {
             trigger_bonus: 0.10,
             trigger_match_weight: 1.0,
             retrieve_penalty: 0.20,
+            adapt_penalty: 0.10,
+            n_adapt: 2,
+            bidir: true,
+            surprise_weight: 0.0,
             mmr_lambda: 0.75,
             p_nucleus: 1.0,
             k_top: 0,

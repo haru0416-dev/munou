@@ -12,6 +12,8 @@ pub struct Proposal {
     pub source: PathKind,
     pub text: String,
     pub tokens: Vec<TokenId>,
+    /// Mean −ln p per generated token (generated candidates only).
+    pub surprise: Option<f32>,
 }
 
 #[derive(Debug, Default)]
@@ -21,6 +23,16 @@ pub struct Pool {
 
 impl Pool {
     pub fn push(&mut self, source: PathKind, text: String, tokens: Vec<TokenId>) {
+        self.push_scored(source, text, tokens, None);
+    }
+
+    pub fn push_scored(
+        &mut self,
+        source: PathKind,
+        text: String,
+        tokens: Vec<TokenId>,
+        surprise: Option<f32>,
+    ) {
         if text.trim().is_empty() {
             return;
         }
@@ -31,6 +43,7 @@ impl Pool {
             source,
             text,
             tokens,
+            surprise,
         });
     }
 
@@ -48,6 +61,10 @@ impl Pool {
 
     pub fn sources(&self) -> Vec<PathKind> {
         self.items.iter().map(|p| p.source).collect()
+    }
+
+    pub fn surprises(&self) -> Vec<Option<f32>> {
+        self.items.iter().map(|p| p.surprise).collect()
     }
 }
 

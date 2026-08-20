@@ -19,6 +19,7 @@
 //! | 観察窓・説明・評価 | `observe`, `explain`, `eval` |
 //! | 大量ログの合成 | `fabricate` |
 
+mod adapt;
 mod alias;
 mod embed;
 mod engine;

@@ -6,11 +6,12 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rustc_hash::FxHashSet;
 
+use crate::adapt::PairStore;
 use crate::embed::{cosine, Embedder, HashEmbedder, TopicTracker};
 use crate::error::Result;
 use crate::eval::EvalAccum;
-use crate::explain::{PathKind, Trace};
-use crate::generate::{generate_one, NextMemo};
+use crate::explain::{GenStep, PathKind, Trace};
+use crate::generate::{generate_one, Generated, NextMemo};
 use crate::ids::{is_special, TokenId};
 use crate::intern::Interner;
 use crate::log::{AppendLog, Record, Role};
@@ -50,7 +51,7 @@ pub struct Stats {
     pub episodic: usize,
     pub meta: usize,
     pub hist: usize,
-    pub path_prior: [f32; 4],
+    pub path_prior: [f32; 5],
 }
 
 pub struct Engine {
@@ -70,8 +71,13 @@ pub struct Engine {
     history: VecDeque<TokenId>,
     /// Retrieve source: past bot utterances with cached embeddings.
     bots: BotStore,
+    /// Adapt source: learned (user → reply) exchanges, Reudy analog.
+    pairs: PairStore,
+    /// Reversed-stream twin of `store` for keyword-anchored bidirectional
+    /// generation (MegaHAL analog). Empty when `bidir` is off.
+    rev_store: Store,
     /// Closed analog of RLHF: additive path prior from `/good` `/bad`.
-    path_prior: [f32; 4],
+    path_prior: [f32; 5],
     /// Last bot path, restored from the log so `/good` works after reopen.
     last_path: Option<PathKind>,
     /// Last `self_window` own reply texts for the self-repetition penalty.
@@ -106,7 +112,7 @@ impl Engine {
         };
         triggers.warm(&embedder);
 
-        let mut path_prior = [0.0f32; 4];
+        let mut path_prior = [0.0f32; 5];
         let mut last_bot_path = None;
         for rec in &log.records {
             match rec.role {
@@ -140,6 +146,8 @@ impl Engine {
             history,
             bots,
             recent_bot,
+            pairs,
+            rev_store,
         } = replayed;
 
         let mut eval = EvalAccum::default();
@@ -165,6 +173,8 @@ impl Engine {
             eval,
             history,
             bots,
+            pairs,
+            rev_store,
             path_prior,
             last_path: last_bot_path,
             recent_bot,
@@ -193,6 +203,7 @@ impl Engine {
         let texts = pool.texts();
         let toks = pool.tokens();
         let sources = pool.sources();
+        let surprises = pool.surprises();
 
         self.recent_bot.make_contiguous();
         let (recent_bot, _) = self.recent_bot.as_slices();
@@ -205,6 +216,7 @@ impl Engine {
                 sources: &sources,
                 input_tokens: &tok.chunks,
                 recent_bot,
+                surprises: &surprises,
                 trigger_match: trigger_tr.as_ref().map(|t| t.similarity).unwrap_or(0.0),
                 path_prior: self.path_prior,
             },
@@ -292,6 +304,13 @@ impl Engine {
         if learned {
             self.absorb(Role::User, input, &tok.chunks);
             self.absorb(Role::Bot, &chosen_text, &chosen_tokens);
+            self.pairs.push_live(
+                &self.embedder,
+                input.to_string(),
+                tok.chunks.clone(),
+                chosen_tokens.clone(),
+                self.params.n_retrieve_scan,
+            );
         }
         for &c in tok.chunks.iter().chain(chosen_tokens.iter()) {
             self.history.push_back(c);
@@ -369,6 +388,21 @@ impl Engine {
                     self.params.n_retrieve_scan,
                 );
             }
+            // Adapt (Reudy analog): deterministic, no RNG, so inserting it
+            // here keeps the RNG-consumption contract of the sources below.
+            if self.params.n_adapt > 0 && self.pairs.len() > 0 {
+                self.pairs.propose(
+                    &mut pool,
+                    &self.intern,
+                    &self.store,
+                    input,
+                    &tok.chunks,
+                    input_emb,
+                    topic,
+                    self.params.n_adapt,
+                    self.params.n_retrieve_scan,
+                );
+            }
             let markov_ok = route.run_markov
                 && (self.params.mix == MixMode::Exclusive || !self.store.is_empty());
             let n_cand = if self.params.mix == MixMode::Exclusive {
@@ -412,6 +446,10 @@ impl Engine {
             return;
         }
         self.store.push_utterance(chunks);
+        if self.params.bidir {
+            let rev: Vec<TokenId> = chunks.iter().rev().copied().collect();
+            self.rev_store.push_utterance(&rev);
+        }
         if role == Role::Bot {
             self.bots.push_live(
                 &self.embedder,
@@ -439,23 +477,35 @@ impl Engine {
         };
         let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
         self.store.warm_sampling(kn);
+        // MegaHAL analog: anchor on the rarest in-corpus content chunk of the
+        // input and grow the reply in both directions around it. Half the
+        // candidate slots try this when an anchor exists.
+        let anchor = self.pick_anchor(user_chunks);
+        let n_bi = if anchor.is_some() { n_cand / 2 } else { 0 };
         let mut memo = NextMemo::default();
+        let mut memo_rev = NextMemo::default();
         let mut seen = FxHashSet::default();
         let mut attempts = 0;
         let start = pool.items.len();
         while pool.items.len() - start < n_cand && attempts < n_cand.max(1) * 4 {
             attempts += 1;
-            let uni = self.store.sampling_view(kn).expect("warmed above");
-            let g = generate_one(
-                &self.store,
-                self.smoothing.as_ref(),
-                &self.params,
-                &ctx_seed,
-                &parrot,
-                uni,
-                &mut memo,
-                &mut self.rng,
-            );
+            let g = if pool.items.len() - start < n_bi {
+                let anchor = anchor.expect("n_bi > 0 implies anchor");
+                self.gen_anchored(anchor, kn, &mut memo, &mut memo_rev)
+            } else {
+                let uni = self.store.sampling_view(kn).expect("warmed above");
+                generate_one(
+                    &self.store,
+                    self.smoothing.as_ref(),
+                    &self.params,
+                    &ctx_seed,
+                    &parrot,
+                    uni,
+                    &mut memo,
+                    &mut self.rng,
+                )
+            };
+            let surprise = mean_surprise(&g.steps);
             let mut toks = g.tokens;
             trim_leading_punct(&self.intern, &mut toks);
             if toks.is_empty() {
@@ -477,7 +527,7 @@ impl Engine {
             if steps.is_empty() {
                 *steps = g.steps;
             }
-            pool.push(PathKind::Markov, text, toks);
+            pool.push_scored(PathKind::Markov, text, toks, surprise);
         }
         if self.params.mix == MixMode::Exclusive && pool.is_empty() {
             let parrot_strs: Vec<String> = user_chunks
@@ -491,6 +541,79 @@ impl Engine {
                 pool.push(PathKind::Markov, parrot_text, user_chunks.to_vec());
             }
         }
+    }
+
+    /// Rarest in-corpus content chunk of the input; ties go to the later
+    /// position (fresher topic). None when nothing usable is in the corpus.
+    fn pick_anchor(&self, user_chunks: &[TokenId]) -> Option<TokenId> {
+        if !self.params.bidir || self.store.is_empty() || self.rev_store.is_empty() {
+            return None;
+        }
+        let mut best: Option<(u32, usize, TokenId)> = None;
+        for (i, &id) in user_chunks.iter().enumerate() {
+            if is_special(id) || crate::tokenizer::is_punct_str(self.intern.get(id)) {
+                continue;
+            }
+            let c = self.store.count_of(id);
+            if c == 0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((bc, bi, _)) => c < bc || (c == bc && i > bi),
+            };
+            if better {
+                best = Some((c, i, id));
+            }
+        }
+        best.map(|(_, _, id)| id)
+    }
+
+    /// One keyword-anchored candidate: forward continuation after the anchor
+    /// on the normal store, then leftward growth on the reversed-stream twin
+    /// (a suffix walk there predicts the *preceding* chunk). MegaHAL's
+    /// two-model trick with both models being the same SA machinery.
+    fn gen_anchored(
+        &mut self,
+        anchor: TokenId,
+        kn: bool,
+        memo: &mut NextMemo,
+        memo_rev: &mut NextMemo,
+    ) -> Generated {
+        self.store.warm_sampling(kn);
+        self.rev_store.warm_sampling(kn);
+        let uni = self.store.sampling_view(kn).expect("warmed above");
+        let fwd = generate_one(
+            &self.store,
+            self.smoothing.as_ref(),
+            &self.params,
+            &[anchor],
+            &[],
+            uni,
+            memo,
+            &mut self.rng,
+        );
+        let mut seq = vec![anchor];
+        seq.extend(fwd.tokens);
+        let mut bparams = self.params.clone();
+        bparams.max_gen_len = self.params.max_gen_len.saturating_sub(seq.len()).max(1);
+        let rev_ctx: Vec<TokenId> = seq.iter().rev().copied().collect();
+        let uni_rev = self.rev_store.sampling_view(kn).expect("warmed above");
+        let bwd = generate_one(
+            &self.rev_store,
+            self.smoothing.as_ref(),
+            &bparams,
+            &rev_ctx,
+            &[],
+            uni_rev,
+            memo_rev,
+            &mut self.rng,
+        );
+        let mut tokens: Vec<TokenId> = bwd.tokens.iter().rev().copied().collect();
+        tokens.extend(seq);
+        let mut steps = fwd.steps;
+        steps.extend(bwd.steps);
+        Generated { tokens, steps }
     }
 
     fn propose_echo(&mut self, pool: &mut Pool, tok: &Tokenized) {
@@ -509,6 +632,9 @@ impl Engine {
 
     pub fn rebuild(&mut self) -> Result<()> {
         self.store.merge();
+        if self.params.bidir {
+            self.rev_store.merge();
+        }
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
@@ -656,12 +782,14 @@ impl Engine {
         self.history = replayed.history;
         self.bots = replayed.bots;
         self.recent_bot = replayed.recent_bot;
+        self.pairs = replayed.pairs;
+        self.rev_store = replayed.rev_store;
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
 }
 
-fn apply_pref(prior: &mut [f32; 4], path: PathKind, good: bool, step: f32, clip: f32) {
+fn apply_pref(prior: &mut [f32; 5], path: PathKind, good: bool, step: f32, clip: f32) {
     let i = route::prior_index(path);
     let d = if good { step } else { -step };
     let clip = clip.max(0.0);
@@ -677,6 +805,26 @@ struct Replayed {
     history: VecDeque<TokenId>,
     bots: BotStore,
     recent_bot: VecDeque<String>,
+    pairs: PairStore,
+    rev_store: Store,
+}
+
+/// MegaHAL's surprise: mean −ln p over the generation steps (None when no
+/// step carried probability mass).
+fn mean_surprise(steps: &[GenStep]) -> Option<f32> {
+    let mut sum = 0.0f32;
+    let mut n = 0u32;
+    for s in steps {
+        if s.p > 0.0 && s.logp.is_finite() {
+            sum -= s.logp;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        None
+    } else {
+        Some(sum / n as f32)
+    }
 }
 
 /// A generated reply must not open with punctuation (「、おはよう」): the
@@ -717,10 +865,14 @@ fn replay_speech(
 
     let mut intern = Interner::new();
     let mut store = Store::new(params.merge_threshold);
+    let mut rev_store = Store::new(params.merge_threshold);
     let mut topic = TopicTracker::new(params.embed_dim, params.k_topic);
     let mut history = VecDeque::new();
     let mut bots = BotStore::default();
+    let mut pairs = PairStore::default();
     let mut recent_bot: VecDeque<String> = VecDeque::new();
+    // (user utterance, chunks) waiting for the reply that completes a pair.
+    let mut pending_user: Option<(String, Vec<TokenId>)> = None;
 
     let n_user = recs
         .iter()
@@ -735,9 +887,24 @@ fn replay_speech(
         let tok = tokenizer.tokenize(&mut intern, text);
         if *learned {
             store.push_utterance_deferred(&tok.chunks);
+            if params.bidir {
+                let rev: Vec<TokenId> = tok.chunks.iter().rev().copied().collect();
+                rev_store.push_utterance_deferred(&rev);
+            }
             if *role == Role::Bot {
                 bots.push_raw(text.to_string(), tok.chunks.clone());
             }
+        }
+        match *role {
+            Role::User => pending_user = Some((text.to_string(), tok.chunks.clone())),
+            Role::Bot => {
+                if let Some((ut, uc)) = pending_user.take() {
+                    if *learned {
+                        pairs.push_raw(ut, uc, tok.chunks.clone());
+                    }
+                }
+            }
+            Role::Meta => {}
         }
         if *role == Role::Bot && params.self_window > 0 {
             recent_bot.push_back(text.to_string());
@@ -758,8 +925,12 @@ fn replay_speech(
         }
     }
     store.merge();
+    if params.bidir {
+        rev_store.merge();
+    }
     trim_history(&mut history, params.l_max_capped() * 4);
     bots.finish(embedder, params.n_retrieve_scan);
+    pairs.finish(embedder, params.n_retrieve_scan);
 
     Replayed {
         intern,
@@ -768,6 +939,8 @@ fn replay_speech(
         history,
         bots,
         recent_bot,
+        pairs,
+        rev_store,
     }
 }
 
@@ -877,6 +1050,71 @@ mod tests {
         .unwrap();
         assert!(e2.stats().utterances >= 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The adapt source proposes for inputs similar to a learned exchange,
+    /// and the reversed twin store stays in lockstep with the forward one.
+    #[test]
+    fn adapt_proposes_and_rev_store_tracks() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 21).unwrap();
+        e.respond("コーヒー飲む？").unwrap();
+        e.respond("散歩しよう").unwrap();
+        assert_eq!(
+            e.rev_store.len(),
+            e.store.len(),
+            "reversed twin must mirror the forward store"
+        );
+        let r = e.respond("紅茶飲む？").unwrap();
+        assert!(
+            r.trace
+                .candidates
+                .iter()
+                .any(|c| c.source == PathKind::Adapt),
+            "pool should contain an Adapt candidate: {:?}",
+            r.trace
+                .candidates
+                .iter()
+                .map(|c| (c.source, c.text.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Keyword-anchored bidirectional generation can place the anchor after
+    /// generated left context — a left-to-right decoder from the user's rare
+    /// chunk could never do that.
+    #[test]
+    fn anchored_generation_gives_anchor_left_context() {
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            n_cand: 10,
+            ..Params::default()
+        };
+        let mut e = Engine::ephemeral(params, 17).unwrap();
+        for _ in 0..6 {
+            e.respond("あか、あお、らくだ、みどり").unwrap();
+        }
+        let mut saw_left_context = false;
+        for _ in 0..6 {
+            let r = e.respond("らくだ").unwrap();
+            for c in &r.trace.candidates {
+                if c.source == PathKind::Markov
+                    && c.text.contains("らくだ")
+                    && !c.text.starts_with("らくだ")
+                {
+                    saw_left_context = true;
+                }
+            }
+        }
+        assert!(
+            saw_left_context,
+            "some markov candidate should contain the anchor mid-text"
+        );
     }
 
     /// Non-trigger replies never exactly repeat one of the last

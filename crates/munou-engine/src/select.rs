@@ -31,10 +31,12 @@ pub struct RankInput<'a> {
     /// score. Char-level on purpose: token ids drift across reopen
     /// (re-tokenised text vs generation chunks), text does not.
     pub recent_bot: &'a [String],
+    /// Per-candidate mean −ln p of generation (None for non-generated).
+    pub surprises: &'a [Option<f32>],
     /// Pattern-input cosine of the trigger hit, or 0.
     pub trigger_match: f32,
     /// Closed analog of RLHF: additive logit on PathKind from `/good` `/bad`.
-    pub path_prior: [f32; 4],
+    pub path_prior: [f32; 5],
 }
 
 pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32 {
@@ -43,6 +45,7 @@ pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32
         PathKind::Markov => 0.0,
         PathKind::Retrieve => -params.retrieve_penalty,
         PathKind::Echo => -params.echo_penalty,
+        PathKind::Adapt => -params.adapt_penalty,
     }
 }
 
@@ -92,9 +95,14 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
                 .iter()
                 .map(|prev| overlap_ratio(&cand_chars, prev))
                 .fold(0.0f32, f32::max);
+        // MegaHAL's surprise term, off by default (weight 0). Only generated
+        // candidates carry a value, so nonzero weights bias between sources.
+        let surprise_term =
+            params.surprise_weight * input.surprises.get(i).copied().flatten().unwrap_or(0.0);
         let score = topic_s
             + source_bias(source, params, input.trigger_match)
             + input.path_prior[crate::route::prior_index(source)]
+            + surprise_term
             - rote
             - self_rote
             - params.band_penalty * band_hinge(topic_s, params.band_lo, params.band_hi);
@@ -123,6 +131,7 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
             topic_score: *topic_s,
             score: *score,
             chosen: *i == index,
+            surprise: input.surprises.get(*i).copied().flatten(),
         })
         .collect();
 
@@ -163,9 +172,10 @@ mod tests {
                 tokens: &toks,
                 sources: &sources,
                 input_tokens: &[],
+                surprises: &[],
                 recent_bot: &[],
                 trigger_match: 0.0,
-                path_prior: [0.0; 4],
+                path_prior: [0.0; 5],
             },
             &params,
             &mut rng,
@@ -195,9 +205,10 @@ mod tests {
                 tokens: &toks,
                 sources: &sources,
                 input_tokens: &[7, 8],
+                surprises: &[],
                 recent_bot: &[],
                 trigger_match: 1.0,
-                path_prior: [0.0; 4],
+                path_prior: [0.0; 5],
             },
             &params,
             &mut rng,
@@ -232,9 +243,10 @@ mod tests {
                 tokens: &toks,
                 sources: &sources,
                 input_tokens: &[],
+                surprises: &[],
                 recent_bot: &recent,
                 trigger_match: 0.0,
-                path_prior: [0.0; 4],
+                path_prior: [0.0; 5],
             },
             &params,
             &mut rng,

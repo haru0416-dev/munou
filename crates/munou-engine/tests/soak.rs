@@ -253,6 +253,7 @@ fn path_index(p: PathKind) -> usize {
         PathKind::Markov => 1,
         PathKind::Retrieve => 2,
         PathKind::Echo => 3,
+        PathKind::Adapt => 4,
     }
 }
 

@@ -365,6 +365,11 @@ impl Store {
         !pat.is_empty() && occurs(self, pat)
     }
 
+    /// Corpus count of a single token (0 if unseen).
+    pub fn count_of(&self, id: TokenId) -> u32 {
+        self.unigram.get(&id).copied().unwrap_or(0)
+    }
+
     pub fn unigram_counts(&self) -> Vec<(TokenId, u32)> {
         let mut v: Vec<(TokenId, u32)> = self.unigram.iter().map(|(&k, &c)| (k, c)).collect();
         v.sort_by_key(|(id, _)| *id);

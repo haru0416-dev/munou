@@ -122,6 +122,7 @@ fn path_tag(p: PathKind) -> &'static str {
         PathKind::Markov => "Mark",
         PathKind::Retrieve => "Retr",
         PathKind::Echo => "Echo",
+        PathKind::Adapt => "Adpt",
     }
 }
 

@@ -155,6 +155,16 @@ struct Common {
     /// Penalty × overlap with the bot's own recent replies. 0 disables.
     #[arg(long)]
     self_penalty: Option<f32>,
+    /// Disable keyword-anchored bidirectional generation (and its reversed
+    /// twin store).
+    #[arg(long)]
+    no_bidir: bool,
+    /// Max Adapt proposals (0 disables; 2 adds a quoted past user line).
+    #[arg(long)]
+    n_adapt: Option<usize>,
+    /// Experimental: selection weight on generation surprise (mean −ln p).
+    #[arg(long)]
+    surprise_weight: Option<f32>,
     /// Smoothing: naive (Witten-Bell) | kn (modified Kneser-Ney; not KenLM)
     #[arg(long)]
     smoothing: Option<String>,
@@ -312,6 +322,15 @@ fn params_from(c: &Common) -> Params {
     }
     if let Some(s) = c.self_penalty {
         p.self_penalty = s.max(0.0);
+    }
+    if c.no_bidir {
+        p.bidir = false;
+    }
+    if let Some(n) = c.n_adapt {
+        p.n_adapt = n;
+    }
+    if let Some(w) = c.surprise_weight {
+        p.surprise_weight = w;
     }
     if let Some(m) = c.mmr {
         p.mmr_lambda = m.clamp(0.0, 1.0);

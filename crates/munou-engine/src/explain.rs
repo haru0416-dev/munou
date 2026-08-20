@@ -9,6 +9,10 @@ pub enum PathKind {
     Markov,
     Retrieve,
     Echo,
+    /// Reudy-style: the reply that once followed a similar utterance, with
+    /// content chunks substituted from the current input — plus quoted past
+    /// user lines (the light Cleverbot analog).
+    Adapt,
 }
 
 impl PathKind {
@@ -18,6 +22,7 @@ impl PathKind {
             PathKind::Markov => "mark",
             PathKind::Retrieve => "retr",
             PathKind::Echo => "echo",
+            PathKind::Adapt => "adpt",
         }
     }
 }
@@ -45,6 +50,11 @@ pub struct CandidateTrace {
     /// Ranking score (topic ± source prior − input-LCS penalty).
     pub score: f32,
     pub chosen: bool,
+    /// Mean per-token information −ln p of the generation (Markov/Adapt-gen
+    /// candidates only). MegaHAL's surprise measure, recorded for /why and
+    /// the experimental `surprise_weight` selection term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surprise: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +91,7 @@ pub struct Trace {
     pub route: Option<String>,
     /// RLHF-lite path prior from `/good` `/bad`.
     #[serde(default)]
-    pub path_prior: [f32; 4],
+    pub path_prior: [f32; 5],
 }
 
 impl Trace {
@@ -109,8 +119,8 @@ impl Trace {
         let pr = self.path_prior;
         if pr.iter().any(|x| *x != 0.0) {
             s.push_str(&format!(
-                "pref trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2}\n",
-                pr[0], pr[1], pr[2], pr[3]
+                "pref trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2} adpt={:+.2}\n",
+                pr[0], pr[1], pr[2], pr[3], pr[4]
             ));
         }
         s.push_str(&format!(
@@ -130,8 +140,12 @@ impl Trace {
         ));
         for c in &self.candidates {
             let mark = if c.chosen { ">" } else { " " };
+            let surp = c
+                .surprise
+                .map(|s| format!(" surp={s:.2}"))
+                .unwrap_or_default();
             s.push_str(&format!(
-                " {mark} #{:<2} {:+.3} [{}] topic={:+.3}  {}\n",
+                " {mark} #{:<2} {:+.3} [{}] topic={:+.3}{surp}  {}\n",
                 c.rank + 1,
                 c.score,
                 c.source.tag(),
