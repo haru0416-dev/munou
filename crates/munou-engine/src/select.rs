@@ -4,7 +4,7 @@
 //! candidates keep their cosine order; a hinge penalises sim < lo or sim > hi.
 //! Slip samples 2nd+ with a Boltzmann distribution (entropy-regularised argmax).
 
-use rand::Rng;
+use rand_core::Rng;
 
 use crate::alias::AliasTable;
 use crate::embed::{cosine, Embedder};
@@ -110,7 +110,7 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let slip_roll: f64 = rng.gen();
+    let slip_roll: f64 = crate::rng::rand_f64(rng);
     let slipped = slip_roll < params.p_slip && scored.len() >= 2;
     let chosen_rank = if slipped {
         let rest: Vec<f64> = scored[1..].iter().map(|(_, s, _)| *s as f64).collect();
@@ -147,8 +147,8 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
 mod tests {
     use super::*;
     use crate::embed::HashEmbedder;
-    use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use rand_core::SeedableRng;
 
     #[test]
     fn top_rank_without_slip() {

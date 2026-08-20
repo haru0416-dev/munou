@@ -1,6 +1,6 @@
 //! Vose's alias method: O(n) preprocess, O(1) sample.
 
-use rand::Rng;
+use rand_core::Rng;
 
 #[derive(Debug, Clone)]
 pub struct AliasTable {
@@ -75,8 +75,8 @@ impl AliasTable {
     }
 
     pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
-        let i = rng.gen_range(0..self.n);
-        let coin: f64 = rng.gen();
+        let i = crate::rng::rand_below(rng, self.n);
+        let coin: f64 = crate::rng::rand_f64(rng);
         if coin < self.prob[i] {
             i
         } else {
@@ -169,8 +169,8 @@ pub fn temper(weights: &mut [f64], tau: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use rand_core::SeedableRng;
 
     #[test]
     fn alias_matches_weights_roughly() {

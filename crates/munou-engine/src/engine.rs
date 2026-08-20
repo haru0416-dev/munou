@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rand_core::{Rng, SeedableRng};
 use rustc_hash::FxHashSet;
 
 use crate::adapt::PairStore;
@@ -265,7 +265,7 @@ impl Engine {
             .map(|c| c.rank)
             .unwrap_or(0);
 
-        let learn_roll: f64 = self.rng.gen();
+        let learn_roll: f64 = crate::rng::rand_f64(&mut self.rng);
         let learned = learn_roll < self.params.p_learn.clamp(0.0, 1.0);
 
         let trace = Trace {
@@ -1010,14 +1010,14 @@ fn trim_history(h: &mut VecDeque<TokenId>, cap: usize) {
     }
 }
 
-fn parrot_variant<R: rand::Rng + ?Sized>(chunks: &[String], rng: &mut R) -> String {
+fn parrot_variant<R: Rng + ?Sized>(chunks: &[String], rng: &mut R) -> String {
     if chunks.is_empty() {
         return "…".into();
     }
     let mut v = chunks.to_vec();
     // Fisher–Yates, but keep it mild: swap a couple of neighbours
     if v.len() > 1 {
-        let i = rng.gen_range(0..v.len() - 1);
+        let i = crate::rng::rand_below(rng, v.len() - 1);
         v.swap(i, i + 1);
     }
     detokenize(&v)

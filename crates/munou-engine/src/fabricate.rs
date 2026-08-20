@@ -4,9 +4,8 @@
 use std::io::Write;
 use std::path::Path;
 
-use rand::Rng;
-use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use rand_core::SeedableRng;
 
 use crate::error::{Error, Result};
 use crate::log::{Record, Role};
@@ -52,9 +51,9 @@ const MORAE: &[&str] = &[
 ];
 
 fn coin_word(rng: &mut ChaCha8Rng) -> String {
-    let n = 2 + rng.gen_range(0..3); // 2..=4 morae
+    let n = 2 + crate::rng::rand_below(rng, 3); // 2..=4 morae
     (0..n)
-        .map(|_| MORAE[rng.gen_range(0..MORAE.len())])
+        .map(|_| MORAE[crate::rng::rand_below(rng, MORAE.len())])
         .collect()
 }
 
@@ -90,7 +89,7 @@ pub fn records(opts: FabricateOpts) -> Vec<Record> {
         push_pair(&mut out, &mut rng, unique_frac, t0, i, u, b);
     }
     for i in n_pref..pairs {
-        let (u, b) = PAIRS[rng.gen_range(0..PAIRS.len())];
+        let (u, b) = PAIRS[crate::rng::rand_below(&mut rng, PAIRS.len())];
         push_pair(&mut out, &mut rng, unique_frac, t0, i, u, b);
     }
     out
@@ -105,7 +104,7 @@ fn push_pair(
     u: &str,
     b: &str,
 ) {
-    let (u, b) = if rng.gen::<f64>() < unique_frac {
+    let (u, b) = if crate::rng::rand_f64(rng) < unique_frac {
         let w = coin_word(rng);
         (format!("{u} {w}"), format!("{b} {w}"))
     } else {

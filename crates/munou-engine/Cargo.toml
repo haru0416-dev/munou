@@ -11,7 +11,7 @@ description = "Closed, explainable, LLM-free dialogue engine (人工無脳君)"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rand.workspace = true
+rand_core.workspace = true
 rand_chacha.workspace = true
 rustc-hash.workspace = true
 
@@ -19,5 +19,4 @@ rustc-hash.workspace = true
 workspace = true
 
 [dev-dependencies]
-rand = { workspace = true, features = ["small_rng"] }
 serde_json.workspace = true

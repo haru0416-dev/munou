@@ -1,6 +1,6 @@
 //! Markov generation: interpolated variable-order n-grams over a suffix array.
 
-use rand::Rng;
+use rand_core::Rng;
 
 use crate::alias::{nucleus, temper, AliasTable};
 use crate::explain::GenStep;
@@ -384,8 +384,8 @@ mod tests {
     use super::*;
     use crate::smoothing::NaiveBackoff;
     use crate::store::Store;
-    use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use rand_core::SeedableRng;
 
     fn gen_once<R: Rng + ?Sized>(
         store: &mut Store,

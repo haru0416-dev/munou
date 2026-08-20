@@ -18,8 +18,9 @@ const LOCKFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../
 
 /// Closed-world allowlist: every crate the lockfile may contain. A denylist
 /// misses unknown network clients; this fails on ANY new dependency until it
-/// is reviewed and added here (dependency survey 2026-08-20: 45 crates, all
-/// MIT/Apache-family, cargo audit clean, no network/TLS/async anywhere).
+/// is reviewed and added here (dependency survey 2026-08-20: 40 crates after the
+/// v0.1.14 update dropped rand and its OS-entropy chain; all MIT/Apache-
+/// family, cargo audit clean, no network/TLS/async anywhere).
 const ALLOWED_CRATES: &[&str] = &[
     "anstream",
     "anstyle",
@@ -27,17 +28,14 @@ const ALLOWED_CRATES: &[&str] = &[
     "anstyle-query",
     "anstyle-wincon",
     "anyhow",
-    "cfg-if",
     "clap",
     "clap_builder",
     "clap_derive",
     "clap_lex",
     "colorchoice",
-    "getrandom",
     "heck",
     "is_terminal_polyfill",
     "itoa",
-    "libc",
     "memchr",
     "munou-cli",
     "munou-engine",
@@ -45,7 +43,6 @@ const ALLOWED_CRATES: &[&str] = &[
     "ppv-lite86",
     "proc-macro2",
     "quote",
-    "rand",
     "rand_chacha",
     "rand_core",
     "rustc-hash",
@@ -59,7 +56,6 @@ const ALLOWED_CRATES: &[&str] = &[
     "thiserror-impl",
     "unicode-ident",
     "utf8parse",
-    "wasi",
     "windows-link",
     "windows-sys",
     "zerocopy",

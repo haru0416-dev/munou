@@ -35,6 +35,7 @@ mod mix;
 mod observe;
 mod params;
 mod retrieve;
+mod rng;
 mod route;
 mod sais;
 mod select;

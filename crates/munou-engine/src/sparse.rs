@@ -3,7 +3,7 @@
 //! `generate::dist_with_backoff` is the dense reference implementation; the
 //! equivalence tests below pin the two together id by id.
 
-use rand::Rng;
+use rand_core::Rng;
 
 use crate::alias::AliasTable;
 use crate::generate::{counts_to_ml, lookup_counts, parrot_unigram, GenCaches};
@@ -223,7 +223,7 @@ impl SparseDist {
         if z <= 0.0 {
             return None;
         }
-        let r: f64 = rng.gen::<f64>() * z;
+        let r: f64 = crate::rng::rand_f64(rng) * z;
         if r < m_s || m_t <= 0.0 {
             let i = table.sample(rng);
             let p = (self.vals[i].max(0.0) / z) as f32;
@@ -403,8 +403,8 @@ mod tests {
     use super::*;
     use crate::generate::dist_with_backoff;
     use crate::smoothing::NaiveBackoff;
-    use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use rand_core::SeedableRng;
 
     /// The sparse representation must equal the dense reference for every
     /// vocabulary id, for every smoothing / exclusion / mixing combination.
