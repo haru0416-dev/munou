@@ -1,16 +1,13 @@
 //! Deterministic sampling primitives over a raw `Rng` stream.
 //!
-//! The reply-sequence contract is anchored to the ChaCha8 stream (a fixed,
-//! published algorithm) plus the two functions below — not to any external
-//! crate's distribution code. rand 0.9 changed `Uniform` (Canon/Lemire) and
-//! its changelog says so outright: "breaks value stability". Owning these
-//! few lines makes v0.1.14 the last externally-caused sequence break: rand
-//! majors can come and go, the draws below never change.
+//! The reply-sequence contract is the ChaCha8 raw stream plus the two
+//! functions below. External crates' distribution code is excluded from the
+//! contract: uniform-sampling implementations are not value-stable across
+//! their major versions, and the contract must not depend on that.
 
 use rand_core::Rng;
 
 /// Standard-uniform f64 in [0, 1): the top 53 bits of one u64 draw.
-/// Bit-identical to the rand 0.8 `Standard` sampler munou used before.
 #[inline]
 pub(crate) fn rand_f64<R: Rng + ?Sized>(rng: &mut R) -> f64 {
     (rng.next_u64() >> 11) as f64 * (1.0f64 / (1u64 << 53) as f64)

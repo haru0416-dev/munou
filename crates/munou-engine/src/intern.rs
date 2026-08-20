@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{TokenId, BOS, EOS, FIRST_USER, SEP};
 
 /// String intern pool. User strings map onto dense `TokenId`s starting at [`FIRST_USER`].
-/// Each unique string is stored once (`Arc<str>` shared by map and table);
-/// the old `Box<str>` version kept two full copies.
+/// Each unique string is stored once: `Arc<str>` shared by map and table
+/// (separate keys would hold two full copies).
 #[derive(Debug, Clone)]
 pub struct Interner {
     to_id: FxHashMap<Arc<str>, TokenId>,

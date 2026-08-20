@@ -170,7 +170,7 @@ struct Common {
     /// Experimental: selection weight on generation surprise (mean −ln p).
     #[arg(long)]
     surprise_weight: Option<f32>,
-    /// Smoothing: naive (Witten-Bell) | kn (modified Kneser-Ney; not KenLM)
+    /// Smoothing: naive (Witten-Bell) | kn (modified Kneser-Ney)
     #[arg(long)]
     smoothing: Option<String>,
     /// Skip-gram mix weight on sparse contexts. 0 disables.
@@ -200,7 +200,7 @@ struct Common {
     /// Disable 日和 (deterministic per-day modulation; every day becomes なぎ).
     #[arg(long)]
     no_weather: bool,
-    /// 合いの手 base probability per reply. 0 disables the first beat.
+    /// 合いの手 base probability per reply. 0 disables it.
     #[arg(long)]
     interject_rate: Option<f64>,
     /// 関心 selection weight (dual-timescale chunk interest). 0 disables.

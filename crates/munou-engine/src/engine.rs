@@ -41,8 +41,8 @@ pub struct OpenConfig {
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub text: String,
-    /// 合いの手 — a short first beat before `text`, harvested from the own
-    /// log. Display only: not logged, not absorbed (replay stays exact).
+    /// 合いの手 — a short learned line printed before `text`. Display only:
+    /// not logged, not absorbed (replay stays exact).
     pub interject: Option<String>,
     /// 節目 — a growth mark crossed by this turn (counts and days, not fake
     /// emotion). Derived from the log digest, so it never re-fires on replay.
@@ -81,10 +81,10 @@ pub struct Engine {
     history: VecDeque<TokenId>,
     /// Retrieve source: past bot utterances with cached embeddings.
     bots: BotStore,
-    /// Adapt source: learned (user → reply) exchanges, Reudy analog.
+    /// Adapt source: learned (user → reply) exchanges.
     pairs: PairStore,
     /// Reversed-stream twin of `store` for keyword-anchored bidirectional
-    /// generation (MegaHAL analog). Empty when `bidir` is off.
+    /// generation. Empty when `bidir` is off.
     rev_store: Store,
     /// Closed analog of RLHF: additive path prior from `/good` `/bad`.
     path_prior: [f32; 5],
@@ -235,9 +235,8 @@ impl Engine {
         };
         let aloof = self.digest.aloof_left > 0;
         let gains = weather::effective(wthr, aloof);
-        // 口をつく: one draw per turn, before the sources (RNG order is part
-        // of the reproducibility contract — this draw comes first from
-        // v0.1.15 on).
+        // 口をつく: one draw per turn, before the sources (the RNG
+        // consumption order is part of the reproducibility contract).
         let release_roll: f64 = crate::rng::rand_f64(&mut self.rng);
         let release = release_roll < (self.params.hearsay_release * gains.release).clamp(0.0, 1.0);
         let care = day.and_then(|d| self.care_word(d));
@@ -338,9 +337,9 @@ impl Engine {
         let learn_roll: f64 = crate::rng::rand_f64(&mut self.rng);
         let learned = learn_roll < self.params.p_learn.clamp(0.0, 1.0);
 
-        // 合いの手: a short first beat from the own log's frequency
-        // distribution. One roll when the bank is live; one pick when it
-        // fires. Skipped for replies that are already beat-sized.
+        // 合いの手: RNG consumption is fixed — one roll when the bank is
+        // live, one pick when the roll fires. Replies of ≤4 chars skip it
+        // (an interjection before an interjection-length reply doubles up).
         let interject = if self.params.interject_rate > 0.0
             && self.interjects.distinct() >= crate::interject::MIN_DISTINCT
         {
@@ -552,7 +551,7 @@ impl Engine {
                     self.params.n_retrieve_scan,
                 );
             }
-            // Adapt (Reudy analog): deterministic, no RNG, so inserting it
+            // Adapt: deterministic, no RNG, so inserting it
             // here keeps the RNG-consumption contract of the sources below.
             // Pool mode only — exclusive is the v0.1 XOR contract.
             if self.params.mix == MixMode::Pool && self.params.n_adapt > 0 && self.pairs.len() > 0 {
@@ -586,10 +585,10 @@ impl Engine {
         // Exact self-repeats of the newest three replies are dropped
         // outright: the soft penalty ranks them down, but when a whole pool
         // scores badly the least-bad repeat still wins. Only three, not the
-        // full window — a hard ban over all of `self_window` starves a small
-        // register (seed-scale band fell 67→42%); the soft penalty keeps
-        // covering the rest. Triggers stay: repeating the dictionary is a
-        // ritual, not a rut. The fallbacks below refill an emptied pool.
+        // full window — a hard ban over all of `self_window` drops the
+        // seed-scale band 67→42%; the soft penalty covers the rest. Triggers
+        // are exempt: dictionary responses are expected to repeat. The
+        // fallbacks below refill an emptied pool.
         if self.params.self_window > 0 && self.params.self_penalty > 0.0 {
             pool.items.retain(|p| {
                 p.source == PathKind::Trigger
@@ -653,7 +652,7 @@ impl Engine {
         };
         let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
         self.store.warm_sampling(kn);
-        // MegaHAL analog: anchor on the rarest in-corpus content chunk of the
+        // Anchor on the rarest in-corpus content chunk of the
         // input and grow the reply in both directions around it. Half the
         // candidate slots try this when an anchor exists.
         let anchor = self.pick_anchor(user_chunks, release);
@@ -720,7 +719,7 @@ impl Engine {
     /// Rarest in-corpus content chunk of the input; ties go to the later
     /// position (fresher topic). None when nothing usable is in the corpus.
     /// 聞きかじり (heard in fewer than `hearsay_min` utterances) does not
-    /// anchor — a one-off typo must not become the centrepiece — except on
+    /// anchor — a one-off typo must not anchor a reply — except on
     /// 口をつく turns (`release`), when it may slip out.
     fn pick_anchor(&self, user_chunks: &[TokenId], release: bool) -> Option<TokenId> {
         if !self.params.bidir || self.store.is_empty() || self.rev_store.is_empty() {
@@ -751,15 +750,14 @@ impl Engine {
 
     /// One keyword-anchored candidate: forward continuation after the anchor
     /// on the normal store, then leftward growth on the reversed-stream twin
-    /// (a suffix walk there predicts the *preceding* chunk). MegaHAL's
-    /// two-model trick with both models being the same SA machinery.
+    /// (a suffix walk there predicts the *preceding* chunk).
     fn gen_anchored(&mut self, anchor: TokenId, kn: bool) -> Generated {
         self.store.warm_sampling(kn);
         self.rev_store.warm_sampling(kn);
         let uni = self.store.sampling_view(kn).expect("warmed above");
         // The anchor takes one slot of the hard cap; forward gets the rest
         // and backward whatever remains — the total never exceeds
-        // max_gen_len (it used to overshoot by up to 2).
+        // max_gen_len.
         let mut fparams = self.params.clone();
         fparams.max_gen_len = self.params.max_gen_len.saturating_sub(1);
         let fwd = generate_one(
@@ -993,8 +991,7 @@ impl Engine {
     pub fn markov_draw(&mut self) -> usize {
         self.gen_caches.trim();
         let ctx: Vec<TokenId> = self.history.iter().copied().collect();
-        // Last four history tokens in stream order (an earlier version
-        // reversed them by accident).
+        // Last four history tokens, in stream order.
         let parrot: Vec<TokenId> = ctx[ctx.len().saturating_sub(4)..].to_vec();
         let kn = matches!(self.params.smoothing, SmoothingKind::Kn);
         self.store.warm_sampling(kn);
@@ -1067,7 +1064,7 @@ struct Replayed {
     interjects: InterjectBank,
 }
 
-/// MegaHAL's surprise: mean −ln p over the generation steps (None when no
+/// Surprise: mean −ln p over the generation steps (None when no
 /// step carried probability mass).
 fn mean_surprise(steps: &[GenStep]) -> Option<f32> {
     let mut sum = 0.0f32;
@@ -1101,8 +1098,7 @@ fn trim_leading_punct(intern: &Interner, toks: &mut Vec<TokenId>) {
 /// Train the tokenizer on learned records, then replay every speech record
 /// into interner / store / history / bots. Store pushes are deferred and
 /// merged once at the end — no lookups happen mid-replay, so the final state
-/// is identical to per-utterance pushes without the quadratic SA rebuilds
-/// (`Engine::open` used to rebuild every `merge_threshold` tokens).
+/// is identical to per-utterance pushes without quadratic SA rebuilds.
 ///
 /// The topic window takes only user records: that is what the live path
 /// pushes (`respond` embeds the input, never the reply), and replay has to
@@ -1366,8 +1362,8 @@ mod tests {
         );
     }
 
-    /// max_gen_len is a hard cap; anchored bidirectional generation used to
-    /// overshoot it by up to 2.
+    /// max_gen_len is a hard cap, including for anchored bidirectional
+    /// generation.
     #[test]
     fn max_gen_len_is_a_hard_cap() {
         let params = Params {
@@ -1394,8 +1390,8 @@ mod tests {
         }
     }
 
-    /// n_adapt=0 must switch the pair memory off entirely (it used to keep
-    /// growing and embedding every learned turn).
+    /// n_adapt=0 must switch the pair memory off entirely: no growth, no
+    /// per-turn embedding.
     #[test]
     fn n_adapt_zero_disables_pair_store() {
         let params = Params {
@@ -1708,7 +1704,7 @@ mod tests {
                 fired = true;
             }
         }
-        assert!(fired, "rate=1 with a live bank must produce a beat");
+        assert!(fired, "rate=1 with a live bank must produce an interjection");
     }
 
     /// 節目 fires exactly on the crossing turn and never again.

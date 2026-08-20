@@ -1,5 +1,5 @@
-//! Adapt source — the Reudy analog (市川宙, RubyKaigi2006), closed over the
-//! own log. Two proposals per turn at most:
+//! Adapt source — rewrite of a learned exchange, closed over the own log.
+//! Two proposals per turn at most:
 //!
 //! 1. **Adapted reply**: find the learned user utterance most similar to the
 //!    current input, take the reply that followed it, and substitute content
@@ -7,8 +7,8 @@
 //!    「Railsってどうよ」 turns 「Rubyサイコー」 into 「Railsサイコー」).
 //!    Rewriting a real exchange keeps the grammar of the original.
 //! 2. **Quoted user line**: the past user utterance closest to the current
-//!    topic, spoken back — the light Cleverbot analog (role inversion). The
-//!    bot remembering the user's own words is the point; no completeness.
+//!    topic, spoken back (role inversion). The bot remembering the user's
+//!    own words is the point; no completeness.
 //!
 //! Deterministic, no RNG. Everything comes from learned turns of the log.
 
@@ -109,7 +109,7 @@ impl PairStore {
         }
     }
 
-    /// Propose into the pool. `input_emb` matches the utterance (Reudy),
+    /// Propose into the pool. `input_emb` matches the utterance,
     /// `topic` picks the quoted user line (avoids plain echo of the input).
     #[allow(clippy::too_many_arguments)]
     pub fn propose(
@@ -179,8 +179,8 @@ fn is_content(intern: &Interner, id: TokenId) -> bool {
     !is_special(id) && !is_punct_str(intern.get(id))
 }
 
-/// Reudy's substitution at chunk level: chunks unique to the old input that
-/// occur in the old reply are replaced by chunks unique to the new input.
+/// Substitution at chunk level: chunks unique to the base input that occur
+/// in the base reply are replaced by chunks unique to the new input.
 /// Rarest first on both sides (rarest = most contentful); at most two pairs.
 /// No substitution found → the reply proposes as-is (pair-following
 /// retrieval is still informative).

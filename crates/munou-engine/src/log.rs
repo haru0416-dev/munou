@@ -30,7 +30,7 @@ pub struct Record {
     /// Missing field (old seed logs) means learned — the file is a corpus.
     #[serde(default = "default_learned")]
     pub learned: bool,
-    /// Winning source. Written on bot turns from v0.1.3 so path mix survives reopen.
+    /// Winning source. Written on bot turns so the path mix survives reopen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathKind>,
     /// Token LCS against prior absorbed utterances (bot turns).

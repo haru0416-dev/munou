@@ -51,9 +51,8 @@ impl Stage {
 }
 
 /// Incremental digest of the JSONL log. The log is append-only, so the
-/// engine ingests each record once instead of rescanning every record on
-/// every gauge refresh (the old panel walked the whole log per turn —
-/// O(N) on grown logs, 5.4% of a chat process in the 200k-utterance profile).
+/// engine ingests each record once; rescanning per gauge refresh is O(N)
+/// per turn (5.4% of a chat process in the 200k-utterance profile).
 #[derive(Debug, Clone, Default)]
 pub struct LogDigest {
     /// Non-meta records.

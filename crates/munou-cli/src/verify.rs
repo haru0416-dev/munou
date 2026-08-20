@@ -18,9 +18,9 @@ const LOCKFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../
 
 /// Closed-world allowlist: every crate the lockfile may contain. A denylist
 /// misses unknown network clients; this fails on ANY new dependency until it
-/// is reviewed and added here (dependency survey 2026-08-20: 40 crates after the
-/// v0.1.14 update dropped rand and its OS-entropy chain; all MIT/Apache-
-/// family, cargo audit clean, no network/TLS/async anywhere).
+/// is reviewed and added here (dependency survey 2026-08-20: 40 crates, all
+/// MIT/Apache-family, cargo audit clean, no network/TLS/async anywhere; no
+/// OS-entropy chain in the tree).
 const ALLOWED_CRATES: &[&str] = &[
     "anstream",
     "anstyle",

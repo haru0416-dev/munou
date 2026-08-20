@@ -41,9 +41,9 @@ const PAIRS: &[(&str, &str)] = &[
     ("ありがとう", "いえいえ"),
 ];
 
-/// Syllabary for coined words. Closed and synthetic like the old ASCII turn
-/// index, but the grown vocabulary reads as Japanese — digit suffixes leaked
-/// into replies as 「ゲームしよう 4999」.
+/// Syllabary for coined words. Closed and synthetic; kana rather than digit
+/// suffixes because fabricated surface leaks into replies (「ゲームしよう
+/// 4999」 otherwise).
 const MORAE: &[&str] = &[
     "か", "き", "く", "け", "こ", "さ", "し", "す", "そ", "た", "ち", "つ", "て", "と", "な", "に",
     "ぬ", "ね", "の", "は", "ひ", "ふ", "へ", "ほ", "ま", "み", "む", "め", "も", "や", "ゆ", "よ",
@@ -153,7 +153,7 @@ mod tests {
     use super::*;
 
     /// Vocab growth must read as Japanese: no ASCII digits in any fabricated
-    /// text (the old turn-index suffix surfaced in replies as 「…しよう 4999」).
+    /// text (a digit suffix surfaces in replies as 「…しよう 4999」).
     #[test]
     fn unique_words_are_kana_not_digits() {
         let recs = records(FabricateOpts {

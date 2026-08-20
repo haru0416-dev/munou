@@ -98,7 +98,7 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
                 .iter()
                 .map(|prev| overlap_ratio(&cand_chars, prev))
                 .fold(0.0f32, f32::max);
-        // MegaHAL's surprise term, off by default (weight 0). Only generated
+        // Surprise term, off by default (weight 0). Only generated
         // candidates carry a value, so nonzero weights bias between sources.
         let surprise_term =
             params.surprise_weight * input.surprises.get(i).copied().flatten().unwrap_or(0.0);

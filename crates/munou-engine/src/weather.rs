@@ -119,8 +119,8 @@ pub(crate) fn care_index(seed: u64, day: u64, len: usize) -> usize {
     (mix(seed ^ mix(day ^ 0xCA9E_0000)) % len as u64) as usize
 }
 
-/// Effective dials for the turn: weather × よそよそしさ (post-absence damp:
-/// fewer beats, no care word, half the slip until the distance wears off).
+/// Effective dials for the turn: weather × よそよそしさ (while
+/// `digest.aloof_left > 0`: interject 0, care 0, slip ×0.5).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Gains {
     pub slip: f64,

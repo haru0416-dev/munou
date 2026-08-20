@@ -15,8 +15,8 @@
 //! so the suffix array only ever indexes the *deduplicated* stream. Repeats
 //! bump a counter instead of growing the SA: on repetitive logs rebuilds all
 //! but disappear and the index stays a few hundred tokens. All returned
-//! values are identical to the old flat-stream store (the reference test
-//! below pins them against a flat replay).
+//! values are identical to a flat-stream store (the reference test below
+//! pins them against a flat replay).
 //!
 //! Precondition (debug-asserted): lookup patterns never contain SEP/EOS.
 //! Order-dependent cross-utterance patterns are unrepresentable here; the
@@ -310,7 +310,7 @@ impl Store {
         self.bigrams = bigrams;
     }
 
-    /// Chen-Goodman D1/D2/D3+ from this corpus. Not an ARPA / KenLM file.
+    /// Chen-Goodman D1/D2/D3+ from this corpus.
     pub fn mkn_discounts(&self, fallback: f64) -> (f64, f64, f64) {
         crate::smoothing::chen_goodman(
             self.bigram_n1,

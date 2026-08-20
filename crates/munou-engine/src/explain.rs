@@ -9,9 +9,9 @@ pub enum PathKind {
     Markov,
     Retrieve,
     Echo,
-    /// Reudy-style: the reply that once followed a similar utterance, with
-    /// content chunks substituted from the current input — plus quoted past
-    /// user lines (the light Cleverbot analog).
+    /// The reply that once followed a similar utterance, with content
+    /// chunks substituted from the current input — plus quoted past user
+    /// lines.
     Adapt,
 }
 
@@ -50,9 +50,9 @@ pub struct CandidateTrace {
     /// Ranking score (topic ± source prior − input-LCS penalty).
     pub score: f32,
     pub chosen: bool,
-    /// Mean per-token information −ln p of the generation (Markov/Adapt-gen
-    /// candidates only). MegaHAL's surprise measure, recorded for /why and
-    /// the experimental `surprise_weight` selection term.
+    /// Mean per-token information −ln p of the generation (generated
+    /// candidates only). Recorded for /why and the experimental
+    /// `surprise_weight` selection term.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surprise: Option<f32>,
 }
@@ -86,7 +86,7 @@ pub struct Trace {
     pub novelty_lcs: usize,
     pub similarity: f32,
     pub band_hit: bool,
-    /// Closed analog of a tool/MoE trace. None on old in-memory tests that skip routing.
+    /// Closed analog of a tool/MoE trace. None on in-memory tests that skip routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
     /// RLHF-lite path prior from `/good` `/bad`.
@@ -96,7 +96,7 @@ pub struct Trace {
     /// `はずみ slip×1.2 合いの手×1.6`. None when weather is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weather: Option<String>,
-    /// 合いの手 spoken before the reply this turn (display beat; not logged,
+    /// 合いの手 spoken before the reply this turn (display only; not logged,
     /// not absorbed — a verbatim copy of an already-learned line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interject: Option<String>,

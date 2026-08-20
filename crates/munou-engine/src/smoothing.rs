@@ -221,7 +221,7 @@ pub fn boxed(kind: SmoothingKind, kn_discount: f64) -> Box<dyn Smoothing> {
 }
 
 /// Copy corpus MKN discounts onto the live smoother. `kn_discount == 0` keeps
-/// discounts at zero (soak / ablation). This is not KenLM and does not load ARPA.
+/// discounts at zero (soak / ablation).
 pub fn sync_to_store(sm: &mut dyn Smoothing, params: &Params, store: &Store) {
     if !matches!(params.smoothing, SmoothingKind::Kn) {
         return;

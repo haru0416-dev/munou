@@ -79,9 +79,9 @@ pub struct Params {
     pub adapt_penalty: f32,
     /// Max Adapt proposals: 1 = adapted reply, 2 = + a quoted past user line.
     pub n_adapt: usize,
-    /// Keyword-anchored bidirectional generation (MegaHAL analog) on a
-    /// reversed-stream twin store. Costs a second SA (memory and merge time
-    /// roughly double on the store side).
+    /// Keyword-anchored bidirectional generation on a reversed-stream twin
+    /// store. Costs a second SA (memory and merge time roughly double on
+    /// the store side).
     pub bidir: bool,
     /// Experimental selection term: score += weight × mean −ln p of the
     /// candidate's generation steps. 0 = record surprise in /why only.

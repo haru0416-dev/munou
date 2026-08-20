@@ -1,14 +1,11 @@
-//! 合いの手 — a short first beat before the reply, harvested from the own log.
+//! 合いの手 — 返答の前に出す、学習済みの短い一行。
 //!
-//! ムチォ系の連投分析が示すとおり、生きた相槌には強い頻度の偏りがある。
-//! munou はテーブルを持ち込まず、自ログの学習済み短発話（≤ `MAX_CHARS` 文字）を
-//! 頻度つきで収穫して、その分布から引く。閉世界のまま「はい」が過半になるのは、
-//! 飼い主がそう話したときだけ。
+//! 固定テーブルは持たない。自ログの学習済み短発話（≤ `MAX_CHARS` 文字）を
+//! 頻度つきで収穫し、その分布から引く（§2 閉世界: 素材は自ログのみ）。
 //!
-//! The interjection is a display beat, not a corpus event: it is a verbatim
-//! copy of an already-learned line, so it is neither logged nor re-absorbed
-//! (replay stays exact), and like triggers it is exempt from the
-//! self-repetition penalty — repeating a ritual is not a rut.
+//! Constraints: display only — a verbatim copy of an already-learned line,
+//! neither logged nor re-absorbed, so replay is unchanged. Exempt from the
+//! self-repetition penalty, like triggers.
 
 use rand_core::Rng;
 
@@ -37,7 +34,7 @@ impl InterjectBank {
             return;
         }
         if t.chars().all(|c| !c.is_alphanumeric() && !is_kana_or_cjk(c)) {
-            return; // punctuation-only lines are not a beat
+            return; // punctuation-only lines are excluded
         }
         match self.index.get(t) {
             Some(&i) => self.items[i].1 += 1,
@@ -54,8 +51,8 @@ impl InterjectBank {
     }
 
     /// Frequency-weighted draw. Returns `None` when the bank is too small or
-    /// the draw lands on `exclude` (skip the beat rather than redraw — the
-    /// number of RNG draws per call is fixed at one).
+    /// the draw lands on `exclude` (no redraw: RNG consumption per call is
+    /// fixed at one draw).
     pub fn pick<R: Rng + ?Sized>(&self, rng: &mut R, exclude: &str) -> Option<String> {
         if self.distinct() < MIN_DISTINCT || self.total == 0 {
             return None;

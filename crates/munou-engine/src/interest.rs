@@ -7,9 +7,9 @@
 //!
 //! A chunk seen in fewer than `hearsay_min` distinct utterances is 聞きかじり
 //! (hearsay): it carries no interest weight and is skipped as a generation
-//! anchor, except on 口をつく turns (`hearsay_release`) when it may slip out.
-//! This keeps one-off typos and mishearings from becoming centrepieces while
-//! still letting rare words surface occasionally.
+//! anchor, except on 口をつく turns (`hearsay_release`). Gate reason: a chunk
+//! absorbed once (typo, mishearing) must not anchor a reply; the release
+//! turns keep rare words reachable.
 
 use rustc_hash::FxHashMap;
 
@@ -23,8 +23,8 @@ pub(crate) const HALF_SLOW: f64 = 10_000.0;
 const HEAT_CAP: f64 = 6.0;
 /// 根 contributes at most this much (after log10 compression).
 const ROOT_CAP: f64 = 4.0;
-/// Raw heat is allowed to overshoot the cap a little so a burst of mentions
-/// keeps the term saturated for a while instead of resetting the decay race.
+/// Raw heat may exceed HEAT_CAP: repeated mentions then extend how long the
+/// term stays saturated after they stop.
 const HEAT_RAW_CAP: f64 = 2.0 * HEAT_CAP;
 
 #[derive(Debug, Clone, Default)]
@@ -110,7 +110,7 @@ mod tests {
         let mut l = InterestLedger::default();
         l.learn(&[70], no_punct);
         let s0 = l.score(70, 1).unwrap();
-        // Advance the clock by one fast half-life without touching 7.
+        // Advance the clock by one fast half-life without touching the chunk.
         let filler: Vec<TokenId> = vec![80; HALF_FAST as usize];
         l.learn(&filler, no_punct);
         let s1 = l.score(70, 1).unwrap();

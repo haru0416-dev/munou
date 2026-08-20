@@ -15,7 +15,7 @@ pub struct TriggerDict {
     entries: Vec<TriggerEntry>,
     /// Pattern embeddings, filled once by `warm`. Same values the embedder
     /// produces; caching them stops re-embedding the whole dictionary every
-    /// turn (the retrieve side got the same fix in v0.1.8).
+    /// turn.
     embs: Vec<Vec<f32>>,
 }
 

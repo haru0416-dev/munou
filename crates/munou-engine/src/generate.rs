@@ -402,9 +402,9 @@ mod tests {
         generate_one(store, smoothing, params, ctx, parrot, uni, &mut caches, rng)
     }
 
-    /// Decode must never emit a special into the token stream: a sampled SEP
-    /// used to be pushed, splicing unrelated utterance openings and, once
-    /// absorbed, planting SEP inside stored utterances.
+    /// Decode must never emit a special into the token stream: a pushed SEP
+    /// splices unrelated utterance openings and, once absorbed, plants SEP
+    /// inside stored utterances.
     #[test]
     fn decode_never_emits_specials() {
         use crate::ids::is_special;

@@ -397,8 +397,8 @@ mod tests {
     }
 
     /// ー between hiragana must not force class-boundary cuts; with a trained
-    /// model and zero in-word branching entropy, らーめん stays one morpheme.
-    /// The old class table pinned ー to katakana and split ら|ー|めん forever.
+    /// model and zero in-word branching entropy, らーめん stays one morpheme
+    /// (a fixed katakana class for ー splits ら|ー|めん unconditionally).
     #[test]
     fn prolonged_mark_joins_neighbouring_run() {
         let mut tok = Tokenizer::new(&Params::default());
