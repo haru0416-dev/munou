@@ -56,6 +56,17 @@ impl PairStore {
         });
     }
 
+    /// Snapshot payload: the retained window without embeddings.
+    pub(crate) fn snap_items(&self) -> impl Iterator<Item = (&str, &[TokenId], &[TokenId])> + '_ {
+        self.items.iter().map(|p| {
+            (
+                p.user_text.as_str(),
+                &p.user_chunks[..],
+                &p.reply_chunks[..],
+            )
+        })
+    }
+
     /// Trim to the scan window, then embed — one embed per distinct user
     /// text (see `BotStore::finish`). Called once at end of replay.
     pub fn finish(&mut self, embedder: &HashEmbedder, scan_cap: usize) {
@@ -63,6 +74,9 @@ impl PairStore {
             let cut = self.items.len() - scan_cap;
             self.items.drain(..cut);
         }
+        // Replay pushes every learned turn before the trim above; drain
+        // keeps the full capacity (~88B per original entry) unless returned.
+        self.items.shrink_to_fit();
         let mut memo: rustc_hash::FxHashMap<String, Vec<f32>> = rustc_hash::FxHashMap::default();
         for p in self.items.iter_mut() {
             p.emb = memo

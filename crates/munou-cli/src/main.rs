@@ -128,7 +128,7 @@ enum Command {
     },
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 struct Common {
     /// Directory for the append-only log (`log.jsonl`).
     #[arg(long, env = "MUNOU_DATA", default_value = "./munou-data")]
@@ -424,7 +424,8 @@ fn say(c: Common, text: &str, explain: bool) -> Result<()> {
 }
 
 fn chat(c: Common, mut explain: bool) -> Result<()> {
-    let mut e = open(c)?;
+    let mut e = open(c.clone())?;
+    let mut spoke = false;
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     writeln!(
@@ -475,6 +476,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             }
             _ => {
                 let r = e.respond(t)?;
+                spoke = true;
                 if let Some(a) = &r.interject {
                     writeln!(stdout, "{a}")?;
                 }
@@ -489,6 +491,17 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
             }
         }
         stdout.flush()?;
+    }
+    // The session appended turns, so the snapshot cache is stale. Rebuild it
+    // now (a fresh open replays and rewrites it) — the cost moves from the
+    // next startup to this shutdown.
+    if spoke {
+        drop(e);
+        write!(stdout, "おぼえなおしています…")?;
+        stdout.flush()?;
+        let t0 = Instant::now();
+        let _ = open(c);
+        writeln!(stdout, " {:.1}s", t0.elapsed().as_secs_f64())?;
     }
     Ok(())
 }

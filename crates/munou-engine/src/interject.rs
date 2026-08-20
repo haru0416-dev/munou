@@ -73,6 +73,26 @@ impl InterjectBank {
     pub fn entries(&self) -> Vec<(String, u64)> {
         self.items.clone()
     }
+
+    /// Snapshot payload: (text, count) in first-seen order — the order is
+    /// part of the deterministic pick.
+    pub(crate) fn snap_items(&self) -> &[(String, u64)] {
+        &self.items
+    }
+
+    pub(crate) fn from_snap(items: Vec<(String, u64)>) -> Self {
+        let mut index = rustc_hash::FxHashMap::default();
+        let mut total = 0u64;
+        for (i, (t, c)) in items.iter().enumerate() {
+            index.insert(t.clone(), i);
+            total += c;
+        }
+        Self {
+            items,
+            index,
+            total,
+        }
+    }
 }
 
 fn is_kana_or_cjk(c: char) -> bool {

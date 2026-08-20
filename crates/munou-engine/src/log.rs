@@ -120,6 +120,11 @@ impl Record {
 
 /// Append-only JSONL conversation log. The file is the source of truth;
 /// the in-memory index is rebuilt from it.
+///
+/// `records` stays resident only without a file (ephemeral / from_text):
+/// file-backed engines hand the parsed records to `Engine::open` once via
+/// `take_records` and never put them back — 2.7M records ≈ 450MB resident
+/// otherwise, alone over the 256MB budget.
 pub struct AppendLog {
     path: Option<PathBuf>,
     file: Option<File>,
@@ -127,6 +132,14 @@ pub struct AppendLog {
 }
 
 impl AppendLog {
+    /// Open for append without parsing existing records (snapshot loads skip
+    /// the parse; the snapshot carries everything the records would feed).
+    pub(crate) fn open_no_parse(path: &Path) -> Result<Self> {
+        let mut log = Self::open_inner(path, false)?;
+        log.records = Vec::new();
+        Ok(log)
+    }
+
     pub fn open(path: Option<&Path>) -> Result<Self> {
         let Some(path) = path else {
             return Ok(Self {
@@ -135,13 +148,17 @@ impl AppendLog {
                 records: Vec::new(),
             });
         };
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: &Path, parse: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
             }
         }
         let mut records = Vec::new();
-        if path.exists() {
+        if parse && path.exists() {
             let f = File::open(path).map_err(|e| Error::io(path, e))?;
             for line in BufReader::new(f).lines() {
                 let line = line.map_err(|e| Error::io(path, e))?;
@@ -199,7 +216,11 @@ impl AppendLog {
     }
 
     /// Serialize all records as JSONL (persistence for hosts without files).
+    /// File-backed logs read the file — records are not resident there.
     pub fn export_text(&self) -> String {
+        if let Some(p) = &self.path {
+            return std::fs::read_to_string(p).unwrap_or_default();
+        }
         let mut out = String::new();
         for r in &self.records {
             if let Ok(line) = serde_json::to_string(r) {
@@ -208,6 +229,35 @@ impl AppendLog {
             }
         }
         out
+    }
+
+    pub fn file_backed(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Move the parsed records out (open-time scans borrow them once). The
+    /// in-memory caller puts them back; the file-backed caller drops them.
+    pub fn take_records(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.records)
+    }
+
+    /// Re-read every record from the file (retokenize on file-backed logs).
+    pub fn read_all(&self) -> Result<Vec<Record>> {
+        let Some(path) = &self.path else {
+            return Ok(self.records.clone());
+        };
+        let f = File::open(path).map_err(|e| Error::io(path, e))?;
+        let mut out = Vec::new();
+        for line in BufReader::new(f).lines() {
+            let line = line.map_err(|e| Error::io(path, e))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(r) = serde_json::from_str::<Record>(&line) {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// Append a user/bot turn as two records with one write and one fsync.
@@ -225,8 +275,10 @@ impl AppendLog {
             f.sync_data()
                 .map_err(|e| Error::io(self.path.clone().unwrap_or_default(), e))?;
         }
-        self.records.push(a);
-        self.records.push(b);
+        if self.file.is_none() {
+            self.records.push(a);
+            self.records.push(b);
+        }
         Ok(())
     }
 
@@ -239,7 +291,9 @@ impl AppendLog {
             f.sync_data()
                 .map_err(|e| Error::io(self.path.clone().unwrap_or_default(), e))?;
         }
-        self.records.push(rec);
+        if self.file.is_none() {
+            self.records.push(rec);
+        }
         Ok(())
     }
 }

@@ -26,10 +26,14 @@ use crate::retrieve::BotStore;
 use crate::route;
 use crate::select::{rank_and_pick, RankInput};
 use crate::smoothing::{self, Smoothing};
+use crate::snapshot;
 use crate::store::Store;
 use crate::tokenizer::{detokenize, Tokenized, Tokenizer};
 use crate::trigger::TriggerDict;
 use crate::weather;
+
+/// (packed key, context count, successors) per entropy side.
+type EntropySide = Vec<(u128, u32, Vec<(u32, u32)>)>;
 
 #[derive(Default)]
 pub struct OpenConfig {
@@ -106,6 +110,8 @@ pub struct Engine {
     interest: InterestLedger,
     /// 合いの手 bank — short learned lines with frequencies.
     interjects: InterjectBank,
+    /// Whether open() loaded the snapshot cache (equality tests + tooling).
+    from_snapshot: bool,
 }
 
 impl Engine {
@@ -119,7 +125,6 @@ impl Engine {
     }
 
     pub fn open(cfg: OpenConfig) -> Result<Self> {
-        let log = AppendLog::open(cfg.log_path.as_deref())?;
         let triggers = if let Some(p) = cfg.triggers_path.as_deref() {
             if p.exists() {
                 TriggerDict::from_path(p)?
@@ -129,7 +134,397 @@ impl Engine {
         } else {
             TriggerDict::default()
         };
+        // Snapshot: a pure cache of the replay state, keyed by (schema rev,
+        // params, log bytes). Hit = skip parse + replay; miss = full build,
+        // then rewrite. Deleting snapshot.bin is always safe.
+        if let Some(path) = cfg.log_path.as_deref() {
+            if path.exists() {
+                if let Ok((log_len, log_fnv)) = snapshot::hash_file(path) {
+                    let params_fnv = params_hash(&cfg.params);
+                    let sp = snapshot::snapshot_path(path);
+                    if let Ok(bytes) = std::fs::read(&sp) {
+                        if let Some(e) = Self::try_snapshot(
+                            &cfg, path, &triggers, &bytes, params_fnv, log_len, log_fnv,
+                        ) {
+                            return Ok(e);
+                        }
+                    }
+                    let log = AppendLog::open(Some(path))?;
+                    let e = Self::assemble(cfg.params, cfg.seed, log, triggers)?;
+                    if log_len >= snapshot::MIN_LOG_BYTES && e.store.buf.is_empty() {
+                        snapshot::write_atomic(
+                            &sp,
+                            &e.snapshot_bytes(params_fnv, log_len, log_fnv),
+                        );
+                    }
+                    return Ok(e);
+                }
+            }
+        }
+        let log = AppendLog::open(cfg.log_path.as_deref())?;
         Self::assemble(cfg.params, cfg.seed, log, triggers)
+    }
+
+    /// Serialize the replay-equivalent state. Called only at the end of a
+    /// full-build `open` — never on a live session (a snapshot of live state
+    /// would make open() depend on cache presence).
+    fn snapshot_bytes(&self, params_fnv: u64, log_len: u64, log_fnv: u64) -> Vec<u8> {
+        let mut w = snapshot::W::header(params_fnv, log_len, log_fnv);
+        // intern
+        let strings = self.intern.snapshot().strings;
+        w.u32(strings.len() as u32);
+        for s in &strings {
+            w.str(s);
+        }
+        // entropy model
+        let es = self.tokenizer.model().snap_dump();
+        w.u8(es.max_n as u8);
+        w.u64(es.total_chars);
+        for side in [&es.fwd, &es.bwd] {
+            w.u64(side.len() as u64);
+            for (k, count, succ) in side {
+                w.u128(*k);
+                w.u32(*count);
+                w.u32(succ.len() as u32);
+                for &(c, n) in succ {
+                    w.u32(c);
+                    w.u32(n);
+                }
+            }
+        }
+        // store dedup list (rev_store derives from it)
+        let utts: Vec<(&[TokenId], u32)> = self.store.dedup_entries().collect();
+        w.u64(utts.len() as u64);
+        for (u, c) in &utts {
+            w.toks(u);
+            w.u32(*c);
+        }
+        // retrieve / adapt windows
+        let bots: Vec<_> = self.bots.snap_items().collect();
+        w.u32(bots.len() as u32);
+        for (t, toks) in bots {
+            w.str(t);
+            w.toks(toks);
+        }
+        let pairs: Vec<_> = self.pairs.snap_items().collect();
+        w.u32(pairs.len() as u32);
+        for (t, uc, rc) in pairs {
+            w.str(t);
+            w.toks(uc);
+            w.toks(rc);
+        }
+        // small engine state
+        let hist: Vec<TokenId> = self.history.iter().copied().collect();
+        w.toks(&hist);
+        w.u32(self.recent_bot.len() as u32);
+        for t in &self.recent_bot {
+            w.str(t);
+        }
+        let topic = self.topic.snap_vecs();
+        w.u32(topic.len() as u32);
+        for v in topic {
+            w.u32(v.len() as u32);
+            for &x in v {
+                w.f32(x);
+            }
+        }
+        let (g, ints) = self.interest.snap_dump();
+        w.u64(g);
+        w.u32(ints.len() as u32);
+        for (id, heat, root, last_g, utts) in ints {
+            w.u32(id);
+            w.f64(heat);
+            w.f64(root);
+            w.u64(last_g);
+            w.u32(utts);
+        }
+        let items = self.interjects.snap_items();
+        w.u32(items.len() as u32);
+        for (t, c) in items {
+            w.str(t);
+            w.u64(*c);
+        }
+        // digest
+        let d = &self.digest;
+        w.u64(d.speech as u64);
+        w.u64(d.meta as u64);
+        w.u64(d.learned as u64);
+        for &p in &d.paths {
+            w.u32(p);
+        }
+        w.u32(d.path_known);
+        match &d.last_bot {
+            None => w.u8(0),
+            Some(lb) => {
+                w.u8(1);
+                w.u8(lb.path.map(path_to_u8).unwrap_or(255));
+                w.u8(lb.learned as u8);
+                match lb.score {
+                    None => w.u8(0),
+                    Some(v) => {
+                        w.u8(1);
+                        w.f32(v);
+                    }
+                }
+                w.u8(match lb.slipped {
+                    None => 2,
+                    Some(false) => 0,
+                    Some(true) => 1,
+                });
+            }
+        }
+        w.u32(d.recent_learned_bot.len() as u32);
+        for t in &d.recent_learned_bot {
+            w.str(t);
+        }
+        w.opt_u64(d.first_speech_t);
+        w.opt_u64(d.last_speech_t);
+        w.opt_str(d.first_learned_user.as_deref());
+        w.u32(d.aloof_left);
+        w.u64(d.last_gap_days);
+        // eval
+        w.u32(self.eval.n);
+        w.u32(self.eval.band_hits);
+        w.u32(self.eval.slip_n);
+        w.f32(self.eval.sim_sum);
+        w.u64(self.eval.lcs_sum as u64);
+        w.u64(self.eval.lcs_len_sum as u64);
+        // prior / last path / rng
+        for &p in &self.path_prior {
+            w.f32(p);
+        }
+        w.u8(self.last_path.map(path_to_u8).unwrap_or(255));
+        w.u128(self.rng.get_word_pos());
+        w.0
+    }
+
+    /// Rebuild from a snapshot. None on any mismatch or truncation — the
+    /// caller falls back to the full build.
+    #[allow(clippy::too_many_arguments)]
+    fn try_snapshot(
+        cfg: &OpenConfig,
+        log_path: &Path,
+        triggers: &TriggerDict,
+        bytes: &[u8],
+        params_fnv: u64,
+        log_len: u64,
+        log_fnv: u64,
+    ) -> Option<Self> {
+        let mut r = snapshot::R::open(bytes, params_fnv, log_len, log_fnv)?;
+        let params = cfg.params.clone();
+        let embedder = HashEmbedder::from_params(&params);
+        // intern
+        let n = r.u32()? as usize;
+        let mut strings = Vec::with_capacity(n);
+        for _ in 0..n {
+            strings.push(r.str()?);
+        }
+        let intern = Interner::from_snapshot(crate::intern::InternerSnap { strings });
+        // entropy model
+        let max_n = r.u8()? as usize;
+        let total_chars = r.u64()?;
+        let read_side = |r: &mut snapshot::R| -> Option<EntropySide> {
+            let n = r.u64()? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let k = r.u128()?;
+                let count = r.u32()?;
+                let m = r.u32()? as usize;
+                let mut succ = Vec::with_capacity(m);
+                for _ in 0..m {
+                    succ.push((r.u32()?, r.u32()?));
+                }
+                v.push((k, count, succ));
+            }
+            Some(v)
+        };
+        let fwd = read_side(&mut r)?;
+        let bwd = read_side(&mut r)?;
+        let tokenizer = Tokenizer::with_model(
+            &params,
+            crate::tokenizer::EntropyModel::from_snap(crate::tokenizer::EntropySnap {
+                max_n,
+                total_chars,
+                fwd,
+                bwd,
+            }),
+        );
+        // store + reversed twin from the same dedup list
+        let n = r.u64()? as usize;
+        let mut utts = Vec::with_capacity(n);
+        for _ in 0..n {
+            let toks = r.toks()?;
+            let c = r.u32()?;
+            utts.push((toks, c));
+        }
+        let store = Store::from_dedup(params.merge_threshold, &utts);
+        let rev_store = if params.bidir {
+            let rev: Vec<(Vec<TokenId>, u32)> = utts
+                .iter()
+                .map(|(u, c)| (u.iter().rev().copied().collect(), *c))
+                .collect();
+            Store::from_dedup(params.merge_threshold, &rev)
+        } else {
+            Store::new(params.merge_threshold)
+        };
+        drop(utts);
+        // retrieve / adapt windows (re-embedded: same embedder, same values)
+        let n = r.u32()? as usize;
+        let mut bots = BotStore::default();
+        for _ in 0..n {
+            let t = r.str()?;
+            let toks = r.toks()?;
+            bots.push_raw(t, toks);
+        }
+        bots.finish(&embedder, params.n_retrieve_scan);
+        let n = r.u32()? as usize;
+        let mut pairs = PairStore::default();
+        for _ in 0..n {
+            let t = r.str()?;
+            let uc = r.toks()?;
+            let rc = r.toks()?;
+            pairs.push_raw(t, uc, rc);
+        }
+        pairs.finish(&embedder, params.n_retrieve_scan);
+        // small engine state
+        let history: VecDeque<TokenId> = r.toks()?.into();
+        let n = r.u32()? as usize;
+        let mut recent_bot = VecDeque::with_capacity(n);
+        for _ in 0..n {
+            recent_bot.push_back(r.str()?);
+        }
+        let n = r.u32()? as usize;
+        let mut window = Vec::with_capacity(n);
+        for _ in 0..n {
+            let m = r.u32()? as usize;
+            let mut v = Vec::with_capacity(m);
+            for _ in 0..m {
+                v.push(r.f32()?);
+            }
+            window.push(v);
+        }
+        let topic = TopicTracker::from_snap(params.embed_dim, params.k_topic, window);
+        let g = r.u64()?;
+        let n = r.u32()? as usize;
+        let mut ints = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = r.u32()?;
+            let heat = r.f64()?;
+            let root = r.f64()?;
+            let last_g = r.u64()?;
+            let utts = r.u32()?;
+            ints.push((id, heat, root, last_g, utts));
+        }
+        let interest = InterestLedger::from_snap(g, ints);
+        let n = r.u32()? as usize;
+        let mut items = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t = r.str()?;
+            let c = r.u64()?;
+            items.push((t, c));
+        }
+        let interjects = InterjectBank::from_snap(items);
+        // digest
+        let d_speech = r.u64()? as usize;
+        let d_meta = r.u64()? as usize;
+        let d_learned = r.u64()? as usize;
+        let mut d_paths = [0u32; 5];
+        for p in d_paths.iter_mut() {
+            *p = r.u32()?;
+        }
+        let d_path_known = r.u32()?;
+        let d_last_bot = match r.u8()? {
+            0 => None,
+            _ => {
+                let path = u8_to_path(r.u8()?);
+                let learned = r.u8()? != 0;
+                let score = match r.u8()? {
+                    0 => None,
+                    _ => Some(r.f32()?),
+                };
+                let slipped = match r.u8()? {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                };
+                Some(crate::observe::LastBot {
+                    path,
+                    learned,
+                    score,
+                    slipped,
+                })
+            }
+        };
+        let n = r.u32()? as usize;
+        let mut d_recent = std::collections::VecDeque::with_capacity(n);
+        for _ in 0..n {
+            d_recent.push_back(r.str()?);
+        }
+        let digest = LogDigest {
+            speech: d_speech,
+            meta: d_meta,
+            learned: d_learned,
+            paths: d_paths,
+            path_known: d_path_known,
+            last_bot: d_last_bot,
+            recent_learned_bot: d_recent,
+            first_speech_t: r.opt_u64()?,
+            last_speech_t: r.opt_u64()?,
+            first_learned_user: r.opt_str()?,
+            aloof_left: r.u32()?,
+            last_gap_days: r.u64()?,
+        };
+        // eval
+        let eval = EvalAccum {
+            n: r.u32()?,
+            band_hits: r.u32()?,
+            slip_n: r.u32()?,
+            sim_sum: r.f32()?,
+            lcs_sum: r.u64()? as usize,
+            lcs_len_sum: r.u64()? as usize,
+        };
+        let mut path_prior = [0.0f32; 5];
+        for p in path_prior.iter_mut() {
+            *p = r.f32()?;
+        }
+        let last_path = u8_to_path(r.u8()?);
+        let rng_pos = r.u128()?;
+
+        let log = AppendLog::open_no_parse(log_path).ok()?;
+        let mut triggers = triggers.clone();
+        triggers.warm(&embedder);
+        let mut smoothing = smoothing::boxed(params.smoothing, params.kn_discount);
+        smoothing::sync_to_store(smoothing.as_mut(), &params, &store);
+        let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
+        rng.set_word_pos(rng_pos);
+        Some(Self {
+            intern,
+            tokenizer,
+            store,
+            embedder,
+            topic,
+            triggers,
+            rng,
+            seed: cfg.seed,
+            params,
+            log,
+            last_trace: None,
+            smoothing,
+            eval,
+            history,
+            bots,
+            pairs,
+            rev_store,
+            path_prior,
+            last_path,
+            digest,
+            gen_caches: GenCaches::default(),
+            gen_caches_rev: GenCaches::default(),
+            recent_bot,
+            interest,
+            interjects,
+            from_snapshot: true,
+        })
     }
 
     /// Filesystem-free entry (browser/embedding): replay a JSONL string;
@@ -155,13 +550,15 @@ impl Engine {
             log_path: None,
             triggers_path: None,
         };
+        let mut log = log;
+        let records = log.take_records();
         let embedder = HashEmbedder::from_params(&cfg.params);
         let mut tokenizer = Tokenizer::new(&cfg.params);
         triggers.warm(&embedder);
 
         let mut path_prior = [0.0f32; 5];
         let mut last_bot_path = None;
-        for rec in &log.records {
+        for rec in &records {
             match rec.role {
                 Role::Meta => {
                     let pk = rec.path.or(last_bot_path);
@@ -180,8 +577,7 @@ impl Engine {
             }
         }
 
-        let recs: Vec<(Role, &str, bool)> = log
-            .records
+        let recs: Vec<(Role, &str, bool)> = records
             .iter()
             .map(|r| (r.role, r.text.as_str(), r.learned))
             .collect();
@@ -200,22 +596,24 @@ impl Engine {
         } = replayed;
 
         let mut eval = EvalAccum::default();
-        for rec in &log.records {
+        for rec in &records {
             eval.ingest_bot(rec, &cfg.params);
         }
-        let digest = LogDigest::scan(&log.records);
+        let digest = LogDigest::scan(&records);
 
         let mut smoothing = smoothing::boxed(cfg.params.smoothing, cfg.params.kn_discount);
         smoothing::sync_to_store(smoothing.as_mut(), &cfg.params, &store);
         let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
-        if let Some(pos) = log
-            .records
+        if let Some(pos) = records
             .iter()
             .rev()
             .find(|rec| rec.role == Role::Bot)
             .and_then(Record::saved_rng_word_pos)
         {
             rng.set_word_pos(pos);
+        }
+        if !log.file_backed() {
+            log.records = records;
         }
         Ok(Self {
             intern,
@@ -243,7 +641,13 @@ impl Engine {
             recent_bot,
             interest,
             interjects,
+            from_snapshot: false,
         })
+    }
+
+    /// True when this engine came from snapshot.bin instead of a full replay.
+    pub fn opened_from_snapshot(&self) -> bool {
+        self.from_snapshot
     }
 
     pub fn load_triggers(&mut self, path: &Path) -> Result<()> {
@@ -484,10 +888,11 @@ impl Engine {
         let pre_learned = self.digest.learned;
         let pre_last_t = self.digest.last_speech_t;
         let pre_aloof = self.digest.aloof_left;
+        let d_user = rec_user.clone();
+        let d_bot = rec_bot.clone();
         self.log.append_turn(rec_user, rec_bot)?;
-        let n = self.log.records.len();
-        self.digest.ingest(&self.log.records[n - 2].clone());
-        self.digest.ingest(&self.log.records[n - 1].clone());
+        self.digest.ingest(&d_user);
+        self.digest.ingest(&d_bot);
         let milestone = milestone::lines(pre_learned, pre_last_t, pre_aloof, &self.digest)
             .into_iter()
             .next();
@@ -901,9 +1306,8 @@ impl Engine {
             self.params.pref_clip,
         );
         let rec = Record::meta(if good { "good".into() } else { "bad".into() }, Some(path));
+        self.digest.ingest(&rec);
         self.log.append(rec)?;
-        let last = self.log.records.last().expect("just appended").clone();
-        self.digest.ingest(&last);
         Ok(format!(
             "pref {} {:?}  prior={:+.2}",
             if good { "good" } else { "bad" },
@@ -1060,11 +1464,12 @@ impl Engine {
 
     /// Rebuild tokenizer + SA from the log (source of truth).
     pub fn retokenize_from_log(&mut self) -> Result<()> {
+        // read_all: file-backed records are not resident (they re-read here).
         let owned: Vec<(Role, String, bool)> = self
             .log
-            .records
-            .iter()
-            .map(|r| (r.role, r.text.clone(), r.learned))
+            .read_all()?
+            .into_iter()
+            .map(|r| (r.role, r.text, r.learned))
             .collect();
         let recs: Vec<(Role, &str, bool)> = owned
             .iter()
@@ -1088,6 +1493,26 @@ impl Engine {
         smoothing::sync_to_store(self.smoothing.as_mut(), &self.params, &self.store);
         Ok(())
     }
+}
+
+fn params_hash(p: &Params) -> u64 {
+    crate::snapshot::fnv64(serde_json::to_string(p).unwrap_or_default().as_bytes())
+}
+
+fn path_to_u8(p: PathKind) -> u8 {
+    crate::route::prior_index(p) as u8
+}
+
+fn u8_to_path(v: u8) -> Option<PathKind> {
+    [
+        PathKind::Trigger,
+        PathKind::Markov,
+        PathKind::Retrieve,
+        PathKind::Echo,
+        PathKind::Adapt,
+    ]
+    .get(v as usize)
+    .copied()
 }
 
 fn apply_pref(prior: &mut [f32; 5], path: PathKind, good: bool, step: f32, clip: f32) {

@@ -40,11 +40,20 @@ impl BotStore {
     /// embeddings — one embed per distinct text (the log repeats lines
     /// heavily; the embedder is deterministic). Called once at the end of
     /// open / retokenize.
+    /// Snapshot payload: the retained window without embeddings (re-embedded
+    /// on load; same embedder, same values).
+    pub(crate) fn snap_items(&self) -> impl Iterator<Item = (&str, &[TokenId])> + '_ {
+        self.items.iter().map(|b| (b.text.as_str(), &b.toks[..]))
+    }
+
     pub fn finish(&mut self, embedder: &HashEmbedder, scan_cap: usize) {
         if scan_cap > 0 && self.items.len() > scan_cap {
             let cut = self.items.len() - scan_cap;
             self.items.drain(..cut);
         }
+        // Replay pushes every learned turn before the trim above; drain
+        // keeps the full capacity (~88B per original entry) unless returned.
+        self.items.shrink_to_fit();
         let mut memo: rustc_hash::FxHashMap<String, Vec<f32>> = rustc_hash::FxHashMap::default();
         for b in self.items.iter_mut() {
             b.emb = memo

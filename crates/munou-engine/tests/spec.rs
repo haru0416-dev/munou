@@ -628,3 +628,95 @@ fn hybrid_pool_still_lists_echo_with_router() {
     assert!(r.trace.route.as_deref().unwrap_or("").contains("route"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Snapshot contract: loading the cache must equal the full replay — same
+/// replies, same gauges — and any change to log or params must bypass it.
+#[test]
+fn snapshot_equals_full_replay_and_gates_on_identity() {
+    let dir = tmp_dir("snap");
+    let log = dir.join("log.jsonl");
+    let params = Params {
+        p_learn: 1.0,
+        ..Params::default()
+    };
+    let mk_cfg = |p: &Params| OpenConfig {
+        params: p.clone(),
+        seed: 21,
+        log_path: Some(log.clone()),
+        triggers_path: None,
+    };
+    // Grow a log past the snapshot threshold (4KB).
+    {
+        let mut e = Engine::open(mk_cfg(&params)).unwrap();
+        for i in 0..40 {
+            e.respond(&format!("こんにちは、きょうは{i}回目の散歩だね"))
+                .unwrap();
+        }
+    }
+    // A rebuild pass writes the snapshot file.
+    {
+        let e = Engine::open(mk_cfg(&params)).unwrap();
+        assert!(!e.opened_from_snapshot(), "first reopen is a full build");
+    }
+    let snap = dir.join("snapshot.bin");
+    assert!(snap.exists(), "open must write the snapshot cache");
+
+    // Hit: replies and gauges must match a forced full build exactly.
+    let inputs = [
+        "散歩いこう",
+        "コーヒーのむ？",
+        "ねむい",
+        "またね",
+        "うん",
+        "そうだね",
+    ];
+    let mut from_snap = Engine::open(mk_cfg(&params)).unwrap();
+    assert!(from_snap.opened_from_snapshot(), "valid snapshot must load");
+    let snap_bytes = fs::read(&snap).unwrap();
+    fs::remove_file(&snap).unwrap();
+    let mut full = Engine::open(mk_cfg(&params)).unwrap();
+    assert!(!full.opened_from_snapshot());
+    // The forced full build appended nothing but rewrote the snapshot; both
+    // engines now diverge the file, so compare in memory only.
+    assert_eq!(from_snap.stats().tokens, full.stats().tokens);
+    assert_eq!(from_snap.stats().vocab, full.stats().vocab);
+    assert_eq!(from_snap.stats().utterances, full.stats().utterances);
+    assert_eq!(from_snap.observe().panel(), full.observe().panel());
+    assert_eq!(from_snap.ayumi_text(), full.ayumi_text());
+    for line in inputs {
+        let a = from_snap.respond(line).unwrap();
+        let b = full.respond(line).unwrap();
+        assert_eq!(a.text, b.text, "line={line}");
+        assert_eq!(a.interject, b.interject, "line={line}");
+        assert_eq!(a.milestone, b.milestone, "line={line}");
+    }
+
+    // Tamper: appending to the log must invalidate the cache.
+    fs::write(&snap, &snap_bytes).unwrap();
+    {
+        let mut f = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            f,
+            r#"{{"v":1,"t":1,"role":"user","text":"改竄","learned":true}}"#
+        )
+        .unwrap();
+    }
+    let e = Engine::open(mk_cfg(&params)).unwrap();
+    assert!(
+        !e.opened_from_snapshot(),
+        "a grown log must bypass the stale snapshot"
+    );
+
+    // Param change: same log, different params must bypass.
+    let e = Engine::open(mk_cfg(&Params {
+        p_learn: 1.0,
+        n_cand: 7,
+        ..Params::default()
+    }))
+    .unwrap();
+    assert!(
+        !e.opened_from_snapshot(),
+        "params are part of the cache key"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

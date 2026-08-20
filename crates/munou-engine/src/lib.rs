@@ -44,6 +44,7 @@ mod route;
 mod sais;
 mod select;
 mod smoothing;
+mod snapshot;
 mod sparse;
 mod store;
 mod tokenizer;

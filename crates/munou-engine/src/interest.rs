@@ -31,6 +31,9 @@ struct Entry {
     utts: u32,
 }
 
+/// (id, heat, root, last_g, utts) per entry.
+pub(crate) type InterestSnap = Vec<(TokenId, f64, f64, u64, u32)>;
+
 /// Per-chunk 関心 ledger. Rebuilt from the log on open; fed by `absorb` live.
 #[derive(Debug, Default)]
 pub(crate) struct InterestLedger {
@@ -76,6 +79,34 @@ impl InterestLedger {
             .get(&id)
             .map(|e| e.utts < hearsay_min)
             .unwrap_or(true)
+    }
+
+    /// Snapshot payload. Map order is irrelevant: every consumer either
+    /// looks up by id or re-sorts by surface string.
+    pub(crate) fn snap_dump(&self) -> (u64, InterestSnap) {
+        (
+            self.g,
+            self.entries
+                .iter()
+                .map(|(id, e)| (*id, e.heat, e.root, e.last_g, e.utts))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn from_snap(g: u64, entries: InterestSnap) -> Self {
+        let mut m = FxHashMap::default();
+        for (id, heat, root, last_g, utts) in entries {
+            m.insert(
+                id,
+                Entry {
+                    heat,
+                    root,
+                    last_g,
+                    utts,
+                },
+            );
+        }
+        Self { entries: m, g }
     }
 
     /// Established chunk ids (non-hearsay), for the care-word draw and あゆみ.

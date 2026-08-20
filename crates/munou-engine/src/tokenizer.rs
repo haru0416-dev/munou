@@ -57,17 +57,137 @@ fn class(c: char) -> Class {
     }
 }
 
+/// Successor histogram. Up to `INLINE` distinct successors live inline;
+/// only wider contexts pay for a boxed map. The per-context fixed cost is
+/// what dominated resident memory (~200B with boxed keys + per-context map;
+/// ~56B packed), 246MB at 1.5M tokens before this layout.
 #[derive(Default, Debug, Clone)]
 struct NextStats {
     count: u32,
-    next: FxHashMap<u32, u32>,
+    n_inline: u8,
+    inline: [(u32, u32); INLINE],
+    /// Sorted by char — a canonical order, so the entropy float sum is
+    /// identical however the histogram was built (replay or snapshot).
+    /// Boxed to keep the no-spill NextStats at one pointer, not three words.
+    #[allow(clippy::box_collection)]
+    spill: Option<Box<Vec<(u32, u32)>>>,
+}
+
+const INLINE: usize = 3;
+
+impl NextStats {
+    fn bump(&mut self, ch: u32, k: u32) {
+        if let Some(v) = self.spill.as_mut() {
+            match v.binary_search_by_key(&ch, |e| e.0) {
+                Ok(i) => v[i].1 += k,
+                Err(i) => v.insert(i, (ch, k)),
+            }
+            return;
+        }
+        for e in self.inline[..self.n_inline as usize].iter_mut() {
+            if e.0 == ch {
+                e.1 += k;
+                return;
+            }
+        }
+        if (self.n_inline as usize) < INLINE {
+            self.inline[self.n_inline as usize] = (ch, k);
+            self.n_inline += 1;
+            return;
+        }
+        let mut v: Vec<(u32, u32)> = self.inline.to_vec();
+        v.push((ch, k));
+        v.sort_unstable_by_key(|e| e.0);
+        self.spill = Some(Box::new(v));
+    }
+
+    /// Shannon entropy of the successor histogram. Counts equal the boxed-key
+    /// representation exactly; the float summation order is canonical (inline
+    /// insertion order, spill sorted), so cut decisions within one ulp of the
+    /// threshold may differ from the pre-v0.1.16 layout (declared as a
+    /// reply-sequence change, transcript diff 0 in practice).
+    fn entropy(&self) -> f64 {
+        match self.spill.as_ref() {
+            Some(v) => entropy_of(v.iter().map(|&(_, c)| c)),
+            None => entropy_of(
+                self.inline[..self.n_inline as usize]
+                    .iter()
+                    .map(|&(_, c)| c),
+            ),
+        }
+    }
+
+    /// Successors in container order (canonical: inline insertion order,
+    /// spill sorted) — reloading in this order reproduces the container and
+    /// therefore the entropy float sums exactly.
+    fn successors(&self) -> Vec<(u32, u32)> {
+        match self.spill.as_ref() {
+            Some(v) => v.as_ref().clone(),
+            None => self.inline[..self.n_inline as usize].to_vec(),
+        }
+    }
+
+    fn from_successors(count: u32, list: Vec<(u32, u32)>) -> Self {
+        let mut st = NextStats {
+            count,
+            ..NextStats::default()
+        };
+        if list.len() <= INLINE {
+            for (i, e) in list.into_iter().enumerate() {
+                st.inline[i] = e;
+                st.n_inline = i as u8 + 1;
+            }
+        } else {
+            st.spill = Some(Box::new(list));
+        }
+        st
+    }
+}
+
+fn entropy_of<I: Iterator<Item = u32> + Clone>(counts: I) -> f64 {
+    let total: u32 = counts.clone().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let t = total as f64;
+    let mut h = 0.0;
+    for c in counts {
+        if c == 0 {
+            continue;
+        }
+        let p = c as f64 / t;
+        h -= p * p.ln();
+    }
+    h
+}
+
+/// N-gram key: (char+1) packed into 21-bit fields, zero-padded — unambiguous
+/// for n ≤ 6 (Unicode scalars fit 21 bits). One u128 replaces a heap
+/// `Box<[u32]>` per context.
+fn pack(gram: &[u32]) -> u128 {
+    let mut k = 0u128;
+    for &c in gram {
+        k = (k << 21) | (c as u128 + 1);
+    }
+    k
+}
+
+/// (packed key, context count, successors) per entry.
+pub(crate) type EntropyEntries = Vec<(u128, u32, Vec<(u32, u32)>)>;
+
+/// See `EntropyModel::snap_dump`.
+pub(crate) struct EntropySnap {
+    pub max_n: usize,
+    pub total_chars: u64,
+    pub fwd: EntropyEntries,
+    pub bwd: EntropyEntries,
 }
 
 /// Character n-gram statistics collected from the conversation log only.
 #[derive(Debug, Clone, Default)]
 pub struct EntropyModel {
-    fwd: FxHashMap<Box<[u32]>, NextStats>,
-    bwd: FxHashMap<Box<[u32]>, NextStats>,
+    fwd: FxHashMap<u128, NextStats>,
+    bwd: FxHashMap<u128, NextStats>,
     max_n: usize,
     total_chars: u64,
 }
@@ -77,7 +197,9 @@ impl EntropyModel {
         Self {
             fwd: FxHashMap::default(),
             bwd: FxHashMap::default(),
-            max_n: max_n.max(2),
+            // Upper clamp is the packing width; the parameter has no CLI
+            // surface and the default is 5.
+            max_n: max_n.clamp(2, 6),
             total_chars: 0,
         }
     }
@@ -101,16 +223,16 @@ impl EntropyModel {
                 continue;
             }
             for i in 0..=chars.len() - n {
-                let key: Box<[u32]> = chars[i..i + n].into();
+                let key = pack(&chars[i..i + n]);
                 if i > 0 {
-                    let be = self.bwd.entry(key.clone()).or_default();
+                    let be = self.bwd.entry(key).or_default();
                     be.count = be.count.saturating_add(k);
-                    *be.next.entry(chars[i - 1]).or_insert(0) += k;
+                    be.bump(chars[i - 1], k);
                 }
                 let e = self.fwd.entry(key).or_default();
                 e.count = e.count.saturating_add(k);
                 if i + n < chars.len() {
-                    *e.next.entry(chars[i + n]).or_insert(0) += k;
+                    e.bump(chars[i + n], k);
                 }
             }
         }
@@ -120,18 +242,50 @@ impl EntropyModel {
         self.total_chars >= 256
     }
 
+    /// Snapshot payload. Map order is irrelevant (lookup by key only);
+    /// per-context successor order is canonical and round-trips exactly.
+    pub(crate) fn snap_dump(&self) -> EntropySnap {
+        let dump = |m: &FxHashMap<u128, NextStats>| {
+            m.iter()
+                .map(|(k, st)| (*k, st.count, st.successors()))
+                .collect()
+        };
+        EntropySnap {
+            max_n: self.max_n,
+            total_chars: self.total_chars,
+            fwd: dump(&self.fwd),
+            bwd: dump(&self.bwd),
+        }
+    }
+
+    pub(crate) fn from_snap(s: EntropySnap) -> Self {
+        let load = |v: EntropyEntries| {
+            let mut m = FxHashMap::default();
+            for (k, count, list) in v {
+                m.insert(k, NextStats::from_successors(count, list));
+            }
+            m
+        };
+        Self {
+            fwd: load(s.fwd),
+            bwd: load(s.bwd),
+            max_n: s.max_n,
+            total_chars: s.total_chars,
+        }
+    }
+
     fn right_entropy(&self, gram: &[u32]) -> f64 {
-        let Some(st) = self.fwd.get(gram) else {
+        let Some(st) = self.fwd.get(&pack(gram)) else {
             return 0.0;
         };
-        entropy(&st.next)
+        st.entropy()
     }
 
     fn left_entropy(&self, gram: &[u32]) -> f64 {
-        let Some(st) = self.bwd.get(gram) else {
+        let Some(st) = self.bwd.get(&pack(gram)) else {
             return 0.0;
         };
-        entropy(&st.next)
+        st.entropy()
     }
 
     fn cut_score(&self, chars: &[u32], i: usize) -> f64 {
@@ -152,23 +306,6 @@ impl EntropyModel {
         };
         0.5 * hr + 0.5 * hl
     }
-}
-
-fn entropy(hist: &FxHashMap<u32, u32>) -> f64 {
-    let total: u32 = hist.values().copied().sum();
-    if total == 0 {
-        return 0.0;
-    }
-    let t = total as f64;
-    let mut h = 0.0;
-    for &c in hist.values() {
-        if c == 0 {
-            continue;
-        }
-        let p = c as f64 / t;
-        h -= p * p.ln();
-    }
-    h
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +332,18 @@ impl Tokenizer {
 
     pub fn observe(&mut self, text: &str) {
         self.model.observe(text);
+    }
+
+    pub(crate) fn model(&self) -> &EntropyModel {
+        &self.model
+    }
+
+    pub(crate) fn with_model(params: &Params, model: EntropyModel) -> Self {
+        Self {
+            model,
+            cut: params.entropy_cut,
+            chunk_morphs: params.chunk_morphs.max(1),
+        }
     }
 
     /// Weighted observe for replay: identical counts to `k` plain observes.

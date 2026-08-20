@@ -30,6 +30,30 @@ use crate::alias::AliasTable;
 use crate::ids::{TokenId, EOS, SEP};
 use crate::sais::{sa_range, suffix_array};
 
+/// See `Store::wprefix`.
+#[derive(Debug, Clone)]
+enum WPrefix {
+    Small(Vec<u32>),
+    Wide(Vec<u64>),
+}
+
+impl Default for WPrefix {
+    fn default() -> Self {
+        WPrefix::Small(Vec::new())
+    }
+}
+
+impl WPrefix {
+    /// Weighted count of the SA run [r, a). Fits u32: a single pattern's
+    /// occurrences cannot exceed the weighted total that chose the width.
+    fn diff(&self, a: usize, r: usize) -> u32 {
+        match self {
+            WPrefix::Small(v) => v[a] - v[r],
+            WPrefix::Wide(v) => (v[a] - v[r]) as u32,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Store {
     /// Committed dedup stream: each distinct utterance once, wrapped SEP..EOS.
@@ -49,7 +73,9 @@ pub struct Store {
     /// j < i, where weight = multiplicity of the utterance owning sa[j].
     /// Lets a next-token run [r, a) sum its weighted count as a difference —
     /// rebuilt lazily because multiplicities change without touching the SA.
-    wprefix: Vec<u64>,
+    /// u32 while the weighted total fits (8B/entry → 4B; 40MB at 10^7),
+    /// widened on refresh past u32::MAX.
+    wprefix: WPrefix,
     wprefix_stale: bool,
     /// Start offsets in `buf` of the pending distinct utterances.
     pending_offsets: Vec<u32>,
@@ -135,6 +161,31 @@ impl Store {
         self.register(chunks);
         self.stats_dirty = true;
         self.invalidate_unigram_caches();
+    }
+
+    /// Snapshot payload: distinct utterances with multiplicities, in
+    /// first-appearance order — everything else is derived.
+    pub(crate) fn dedup_entries(&self) -> impl Iterator<Item = (&[TokenId], u32)> + '_ {
+        self.utts.iter().map(|(u, c)| (&u[..], *c))
+    }
+
+    /// Rebuild from a snapshot's dedup list. End state equals a full replay:
+    /// register once per distinct with the multiplicity applied directly,
+    /// then the single merge recomputes stats exactly as the replay path.
+    pub(crate) fn from_dedup(merge_threshold: usize, utts: &[(Vec<TokenId>, u32)]) -> Self {
+        let mut s = Self::new(merge_threshold);
+        for (u, c) in utts {
+            if u.is_empty() || *c == 0 {
+                continue;
+            }
+            s.push_utterance_deferred(u);
+            let i = s.utts.len() - 1;
+            s.utts[i].1 = *c;
+            s.total_utts += u64::from(*c) - 1;
+            s.total_tokens += (u.len() + 2) * (*c as usize - 1);
+        }
+        s.merge();
+        s
     }
 
     /// Dedup bookkeeping shared by both push paths.
@@ -253,15 +304,28 @@ impl Store {
 
     /// Rebuild the SA-order multiplicity prefix sums. O(committed tokens);
     /// runs on merge and whenever a committed utterance's count changed.
+    /// `total_tokens` bounds the final accumulator, so the width check is
+    /// exact before building.
     fn refresh_wprefix(&mut self) {
-        self.wprefix.clear();
-        self.wprefix.reserve(self.sa.len() + 1);
-        let mut acc = 0u64;
-        self.wprefix.push(0);
-        for &p in &self.sa {
-            acc += self.utts[self.pos_utt[p as usize] as usize].1 as u64;
-            self.wprefix.push(acc);
-        }
+        self.wprefix = if self.total_tokens <= u32::MAX as usize {
+            let mut v = Vec::with_capacity(self.sa.len() + 1);
+            let mut acc = 0u32;
+            v.push(0);
+            for &p in &self.sa {
+                acc += self.utts[self.pos_utt[p as usize] as usize].1;
+                v.push(acc);
+            }
+            WPrefix::Small(v)
+        } else {
+            let mut v = Vec::with_capacity(self.sa.len() + 1);
+            let mut acc = 0u64;
+            v.push(0);
+            for &p in &self.sa {
+                acc += self.utts[self.pos_utt[p as usize] as usize].1 as u64;
+                v.push(acc);
+            }
+            WPrefix::Wide(v)
+        };
         self.wprefix_stale = false;
     }
 
@@ -405,7 +469,7 @@ impl Store {
                             b = m;
                         }
                     }
-                    body.push((t, (self.wprefix[a] - self.wprefix[r]) as u32));
+                    body.push((t, self.wprefix.diff(a, r)));
                     r = a;
                 }
             }

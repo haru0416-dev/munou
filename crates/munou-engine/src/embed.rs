@@ -115,6 +115,19 @@ impl TopicTracker {
         }
     }
 
+    /// Snapshot payload: the raw window vectors, oldest first.
+    pub(crate) fn snap_vecs(&self) -> &[Vec<f32>] {
+        &self.window
+    }
+
+    pub(crate) fn from_snap(dim: usize, k: usize, window: Vec<Vec<f32>>) -> Self {
+        Self {
+            dim,
+            k: k.max(1),
+            window,
+        }
+    }
+
     pub fn mean(&self, out: &mut [f32]) {
         let d = self.dim.min(out.len());
         out[..d].fill(0.0);
