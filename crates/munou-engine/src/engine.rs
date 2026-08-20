@@ -72,6 +72,8 @@ pub struct Engine {
     bots: Vec<(String, Vec<TokenId>)>,
     /// Closed analog of RLHF: additive path prior from `/good` `/bad`.
     path_prior: [f32; 4],
+    /// Last bot path, restored from the log so `/good` works after reopen.
+    last_path: Option<PathKind>,
 }
 
 impl Engine {
@@ -182,6 +184,7 @@ impl Engine {
             prior,
             bots,
             path_prior,
+            last_path: last_bot_path,
         })
     }
 
@@ -250,6 +253,9 @@ impl Engine {
 
         if pool.is_empty() {
             self.propose_echo(&mut pool, &tok);
+        }
+        if pool.is_empty() {
+            pool.push(PathKind::Echo, "…".into(), Vec::new());
         }
 
         let texts = pool.texts();
@@ -374,6 +380,7 @@ impl Engine {
         }
         trim_history(&mut self.history, self.params.l_max_capped() * 4);
         self.last_trace = Some(trace.clone());
+        self.last_path = Some(path);
 
         Ok(Reply {
             text: chosen_text,
@@ -526,12 +533,25 @@ impl Engine {
         self.last_trace.as_ref()
     }
 
+    /// `/why` surface. After reopen the gen chain is gone; we still show the last bot line.
+    pub fn why_text(&self) -> String {
+        if let Some(tr) = &self.last_trace {
+            return tr.explain_text();
+        }
+        match self.observe().last_why {
+            Some(why) => {
+                format!("{why}\n(reopened; gen chain lives only in the process that spoke)\n")
+            }
+            None => "(no trace yet)\n".into(),
+        }
+    }
+
     /// Closed analog of a preference label. Does not call a reward model.
     pub fn feedback(&mut self, good: bool) -> Result<String> {
-        let Some(tr) = self.last_trace.as_ref() else {
+        let path = self.last_trace.as_ref().map(|t| t.path).or(self.last_path);
+        let Some(path) = path else {
             return Ok("no turn yet".into());
         };
-        let path = tr.path;
         apply_pref(
             &mut self.path_prior,
             path,

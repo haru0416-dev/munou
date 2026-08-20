@@ -34,6 +34,9 @@ impl EvalAccum {
         let Some(score) = rec.score else {
             return;
         };
+        if !score.is_finite() {
+            return;
+        }
         self.n += 1;
         if score >= params.band_lo && score <= params.band_hi {
             self.band_hits += 1;
