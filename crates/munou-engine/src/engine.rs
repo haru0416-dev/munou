@@ -1296,8 +1296,16 @@ mod tests {
 
     #[test]
     fn different_seeds_can_diverge() {
-        let mut a = Engine::ephemeral(Params::default(), 1).unwrap();
-        let mut b = Engine::ephemeral(Params::default(), 2).unwrap();
+        // weather=false: the 日和 dials depend on the current UTC day, so a
+        // fixed seed pair can coincide on some days. This test targets the
+        // seed-split of the RNG stream and must be date-free.
+        let params = Params {
+            weather: false,
+            p_slip: 1.0,
+            ..Params::default()
+        };
+        let mut a = Engine::ephemeral(params.clone(), 1).unwrap();
+        let mut b = Engine::ephemeral(params, 2).unwrap();
         let mut same = 0;
         let mut n = 0;
         for line in ["こんにちは", "おはよう", "ねむい", "ごはん", "また"] {
@@ -1794,10 +1802,13 @@ mod tests {
     /// live (three distinct short learned lines) at rate 1.
     #[test]
     fn interject_beat_fires_and_matches_between_same_seeds() {
+        // weather=false: on a しめり day the dial scales rate 1.0 down to 0.4
+        // and the firing assertion becomes date-dependent.
         let params = Params {
             p_learn: 1.0,
             p_slip: 0.0,
             interject_rate: 1.0,
+            weather: false,
             ..Params::default()
         };
         let mut a = Engine::ephemeral(params.clone(), 11).unwrap();
