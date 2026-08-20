@@ -17,6 +17,7 @@ use crate::log::{now_ms, AppendLog, Record, Role};
 use crate::mix::Pool;
 use crate::observe::Observe;
 use crate::params::{MixMode, Params};
+use crate::route;
 use crate::select::{rank_and_pick, RankInput};
 use crate::smoothing::{self, Smoothing};
 use crate::store::Store;
@@ -45,6 +46,10 @@ pub struct Stats {
     pub vocab: usize,
     pub buf: usize,
     pub topic_window: usize,
+    pub episodic: usize,
+    pub meta: usize,
+    pub hist: usize,
+    pub path_prior: [f32; 4],
 }
 
 pub struct Engine {
@@ -65,6 +70,8 @@ pub struct Engine {
     prior: Vec<Vec<TokenId>>,
     /// Past bot utterances for retrieval (text + chunk ids).
     bots: Vec<(String, Vec<TokenId>)>,
+    /// Closed analog of RLHF: additive path prior from `/good` `/bad`.
+    path_prior: [f32; 4],
 }
 
 impl Engine {
@@ -82,6 +89,9 @@ impl Engine {
         let mut tokenizer = Tokenizer::new(&cfg.params);
         let log = AppendLog::open(cfg.log_path.as_deref())?;
         for rec in &log.records {
+            if rec.role == Role::Meta {
+                continue;
+            }
             if rec.learned {
                 tokenizer.observe(&rec.text);
             }
@@ -105,7 +115,31 @@ impl Engine {
         let mut bots = Vec::new();
         let dim = cfg.params.embed_dim;
 
+        let mut path_prior = [0.0f32; 4];
+        let mut last_bot_path = None;
         for rec in &log.records {
+            match rec.role {
+                Role::Meta => {
+                    let pk = rec.path.or(last_bot_path);
+                    if let Some(pk) = pk {
+                        apply_pref(
+                            &mut path_prior,
+                            pk,
+                            rec.text == "good",
+                            cfg.params.pref_step,
+                            cfg.params.pref_clip,
+                        );
+                    }
+                }
+                Role::Bot => last_bot_path = rec.path,
+                Role::User => {}
+            }
+        }
+
+        for rec in &log.records {
+            if rec.role == Role::Meta {
+                continue;
+            }
             let tok = tokenizer.tokenize(&mut intern, &rec.text);
             if rec.learned {
                 store.push_utterance(&tok.chunks);
@@ -147,6 +181,7 @@ impl Engine {
             history,
             prior,
             bots,
+            path_prior,
         })
     }
 
@@ -167,6 +202,18 @@ impl Engine {
         self.topic.mean(&mut topic);
 
         let trigger_hit = self.triggers.match_one(&self.embedder, input, &self.params);
+        let retr_sim = self.max_bot_sim(&topic);
+        let trig_sim = trigger_hit
+            .as_ref()
+            .map(|(t, _)| t.similarity)
+            .unwrap_or(0.0);
+        let route = route::plan(
+            &self.params,
+            self.store.len(),
+            self.bots.len(),
+            retr_sim,
+            trig_sim,
+        );
 
         let mut pool = Pool::default();
         let mut steps = Vec::new();
@@ -183,14 +230,20 @@ impl Engine {
         let exclusive_skip_rest = self.params.mix == MixMode::Exclusive && !pool.is_empty();
 
         if !exclusive_skip_rest {
-            if self.params.mix == MixMode::Pool {
-                self.propose_retrieve(&mut pool, input, &topic);
+            if route.run_retrieve {
+                self.propose_retrieve(&mut pool, input, &topic, route.n_retrieve);
             }
-            let markov_ok = self.params.mix == MixMode::Exclusive || !self.store.is_empty();
-            if markov_ok {
-                self.propose_markov(&mut pool, &tok.chunks, &mut steps);
+            let markov_ok = route.run_markov
+                && (self.params.mix == MixMode::Exclusive || !self.store.is_empty());
+            let n_cand = if self.params.mix == MixMode::Exclusive {
+                route.n_cand.max(1)
+            } else {
+                route.n_cand
+            };
+            if markov_ok && n_cand > 0 {
+                self.propose_markov(&mut pool, &tok.chunks, &mut steps, n_cand);
             }
-            if self.params.mix == MixMode::Pool {
+            if route.run_echo {
                 self.propose_echo(&mut pool, &tok);
             }
         }
@@ -212,6 +265,7 @@ impl Engine {
                 sources: &sources,
                 input_tokens: &tok.chunks,
                 trigger_match: trigger_tr.as_ref().map(|t| t.similarity).unwrap_or(0.0),
+                path_prior: self.path_prior,
             },
             &self.params,
             &mut self.rng,
@@ -282,6 +336,8 @@ impl Engine {
             novelty_lcs,
             similarity: sim,
             band_hit,
+            route: Some(route.explain_line()),
+            path_prior: self.path_prior,
         };
 
         self.eval.observe(&trace, chosen_tokens.len());
@@ -342,6 +398,7 @@ impl Engine {
         pool: &mut Pool,
         user_chunks: &[TokenId],
         steps: &mut Vec<crate::explain::GenStep>,
+        n_cand: usize,
     ) {
         let mut ctx_seed: Vec<TokenId> = self.history.iter().copied().collect();
         ctx_seed.extend_from_slice(user_chunks);
@@ -353,7 +410,7 @@ impl Engine {
         let mut seen = FxHashSet::default();
         let mut attempts = 0;
         let start = pool.items.len();
-        while pool.items.len() - start < self.params.n_cand && attempts < self.params.n_cand * 4 {
+        while pool.items.len() - start < n_cand && attempts < n_cand.max(1) * 4 {
             attempts += 1;
             let g = generate_one(
                 &self.store,
@@ -399,8 +456,8 @@ impl Engine {
         }
     }
 
-    fn propose_retrieve(&mut self, pool: &mut Pool, input: &str, topic: &[f32]) {
-        if self.bots.is_empty() || self.params.n_retrieve == 0 {
+    fn propose_retrieve(&mut self, pool: &mut Pool, input: &str, topic: &[f32], n_retrieve: usize) {
+        if self.bots.is_empty() || n_retrieve == 0 {
             return;
         }
         let dim = self.embedder.dim();
@@ -416,7 +473,7 @@ impl Engine {
             cands.push((sim, i, buf.clone()));
         }
         let mut picked: Vec<usize> = Vec::new();
-        while picked.len() < self.params.n_retrieve && picked.len() < cands.len() {
+        while picked.len() < n_retrieve && picked.len() < cands.len() {
             let mut best_i = None;
             let mut best_s = f32::NEG_INFINITY;
             for (i, (sim, bot_i, emb)) in cands.iter().enumerate() {
@@ -469,14 +526,82 @@ impl Engine {
         self.last_trace.as_ref()
     }
 
+    /// Closed analog of a preference label. Does not call a reward model.
+    pub fn feedback(&mut self, good: bool) -> Result<String> {
+        let Some(tr) = self.last_trace.as_ref() else {
+            return Ok("no turn yet".into());
+        };
+        let path = tr.path;
+        apply_pref(
+            &mut self.path_prior,
+            path,
+            good,
+            self.params.pref_step,
+            self.params.pref_clip,
+        );
+        self.log.append(Record {
+            v: 1,
+            t: now_ms(),
+            role: Role::Meta,
+            text: if good { "good".into() } else { "bad".into() },
+            slipped: None,
+            score: None,
+            learned: false,
+            path: Some(path),
+            novelty_lcs: None,
+            n_tok: None,
+        })?;
+        Ok(format!(
+            "pref {} {:?}  prior={:+.2}",
+            if good { "good" } else { "bad" },
+            path,
+            self.path_prior[route::prior_index(path)]
+        ))
+    }
+
+    fn max_bot_sim(&self, topic: &[f32]) -> f32 {
+        if self.bots.is_empty() {
+            return 0.0;
+        }
+        let mut buf = vec![0.0f32; self.embedder.dim()];
+        let mut m = 0.0f32;
+        for (text, _) in &self.bots {
+            self.embedder.embed(text, &mut buf);
+            m = m.max(cosine(topic, &buf));
+        }
+        m
+    }
+
     pub fn stats(&self) -> Stats {
+        let episodic = self
+            .log
+            .records
+            .iter()
+            .filter(|r| r.role != Role::Meta)
+            .count();
+        let meta = self
+            .log
+            .records
+            .iter()
+            .filter(|r| r.role == Role::Meta)
+            .count();
+        let learned = self
+            .log
+            .records
+            .iter()
+            .filter(|r| r.role != Role::Meta && r.learned)
+            .count();
         Stats {
-            utterances: self.log.records.len(),
-            learned: self.log.records.iter().filter(|r| r.learned).count(),
+            utterances: episodic,
+            learned,
             tokens: self.store.len(),
             vocab: self.intern.vocab_user(),
             buf: self.store.buf.len(),
             topic_window: self.topic.len(),
+            episodic,
+            meta,
+            hist: self.history.len(),
+            path_prior: self.path_prior,
         }
     }
 
@@ -528,10 +653,11 @@ impl Engine {
             .map(|r| (r.role, r.text.clone(), r.learned))
             .collect();
         self.tokenizer = Tokenizer::new(&self.params);
-        for (_, t, learned) in &recs {
-            if *learned {
-                self.tokenizer.observe(t);
+        for (role, t, learned) in &recs {
+            if *role == Role::Meta || !*learned {
+                continue;
             }
+            self.tokenizer.observe(t);
         }
         self.intern = Interner::new();
         self.store = Store::new(self.params.merge_threshold);
@@ -540,6 +666,9 @@ impl Engine {
         self.bots.clear();
         self.topic = TopicTracker::new(self.embedder.dim(), self.params.k_topic);
         for (role, t, learned) in &recs {
+            if *role == Role::Meta {
+                continue;
+            }
             let tok = self.tokenizer.tokenize(&mut self.intern, t);
             if *learned {
                 self.store.push_utterance(&tok.chunks);
@@ -559,6 +688,13 @@ impl Engine {
         trim_history(&mut self.history, self.params.l_max_capped() * 4);
         Ok(())
     }
+}
+
+fn apply_pref(prior: &mut [f32; 4], path: PathKind, good: bool, step: f32, clip: f32) {
+    let i = route::prior_index(path);
+    let d = if good { step } else { -step };
+    let clip = clip.max(0.0);
+    prior[i] = (prior[i] + d).clamp(-clip, clip);
 }
 
 fn trim_history(h: &mut VecDeque<TokenId>, cap: usize) {
@@ -643,6 +779,64 @@ mod tests {
         })
         .unwrap();
         assert!(e2.stats().utterances >= 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn feedback_is_meta_not_corpus_and_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "munou-pref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log.jsonl");
+        let params = Params {
+            p_learn: 1.0,
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let prior_after;
+        let tokens_after;
+        let utterances_after;
+        let path;
+        {
+            let mut e = Engine::open(OpenConfig {
+                params: params.clone(),
+                seed: 9,
+                log_path: Some(log.clone()),
+                triggers_path: None,
+            })
+            .unwrap();
+            let r = e.respond("こんにちは").unwrap();
+            path = r.trace.path;
+            tokens_after = e.stats().tokens;
+            utterances_after = e.stats().utterances;
+            let msg = e.feedback(true).unwrap();
+            assert!(msg.contains("good"), "{msg}");
+            assert_eq!(e.stats().tokens, tokens_after);
+            assert_eq!(e.stats().utterances, utterances_after);
+            assert_eq!(e.stats().meta, 1);
+            assert!(e.stats().path_prior[route::prior_index(path)] > 0.0);
+            prior_after = e.stats().path_prior;
+            assert!(e.observe().panel().contains("好み"));
+        }
+        let e2 = Engine::open(OpenConfig {
+            params,
+            seed: 9,
+            log_path: Some(log.clone()),
+            triggers_path: None,
+        })
+        .unwrap();
+        assert_eq!(e2.stats().tokens, tokens_after);
+        assert_eq!(e2.stats().utterances, utterances_after);
+        assert_eq!(e2.stats().learned, utterances_after);
+        assert_eq!(e2.stats().meta, 1);
+        assert_eq!(e2.stats().path_prior, prior_after);
+        assert!(e2.stats().path_prior[route::prior_index(path)] > 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -9,7 +9,9 @@ LLM を使わず、理解せずに会話が成立する対話プログラム。�
 
 生成は可変長マルコフ（接尾辞配列の上で次数を補間）、検索は MMR、選択は閉じたハッシュ embedding に帯域ヒンジ。生成用言語モデルは無い。既定はこれらの候補をプールして一本を選ぶ（`--mix exclusive` で v0.1 の XOR に戻せる）。会話ログは毎回残し、コーパス（SA・検索・トークナイザ）への吸収は対話中にランダム（`--p-learn`、既定 0.35）。
 
-観察窓のゲージは既存指標だけ（吸収率・語彙・帯域ヒット・1−rote・slip）。感情モデルは足さない。stage（空 / 記録中 / 芽生え / 育ち / 濃い）もカウントから決める。
+観察窓のゲージは既存指標だけ（吸収率・語彙・帯域ヒット・1−rote・slip）。感情モデルは足さない。stage（空 / 記録中 / 芽生え / 育ち / 濃い）もカウントから決める。記憶は作業（話題窓）・挿話（ログ）・母数（SA / 語彙）として同じ数字を並べるだけ。
+
+LLM は使わない。HuggingFace やチャット API も使わない。温度・nucleus・経路ゲート・好みラベルは、閉じたマルコフと選択器の上に**概念だけ**写したもの。
 
 **アダプタ（伺か SHIORI / Misskey / 常駐）は後段。** いまは CLI だけ。
 
@@ -20,7 +22,7 @@ cargo run -p munou-cli --release -- observe --data-dir ./munou-data --format htm
 ```
 
 ```
-人工無脳君  seed=1  /observe /why /stats /eval /rebuild /retok /explain /quit
+人工無脳君  seed=1  /observe /why /good /bad /stats /eval /rebuild /retok /explain /quit
 > おはよう
 おはよう
 観察 芽生え  吸収██████ 100%  語彙█░░░░░   3  帯域░░░░░░    -  暗記░░░░░░    -  ズレ░░░░░░   -  echo
@@ -29,7 +31,7 @@ cargo run -p munou-cli --release -- observe --data-dir ./munou-data --format htm
 ...
 ```
 
-REPL: 応答の直後に一行ゲージ。`/observe` が本線、`/why` トレース、`/stats` コーパス、`/eval` 帯域ヒットと丸暗記 LCS、`/rebuild` SA 再構築、`/retok` ログ全体を再分割。`--format html` はローカルの自己完結 HTML（サーバではない）。
+REPL: 応答の直後に一行ゲージ。`/observe` が本線、`/why` トレース、`/good` `/bad` が直前の経路を少し好き/嫌いにする（コーパスには入らない）、`/stats` コーパス、`/eval` 帯域ヒットと丸暗記 LCS、`/rebuild` SA 再構築、`/retok` ログ全体を再分割。`--top-p` は nucleus（既定オフ）。`--format html` はローカルの自己完結 HTML（サーバではない）。
 
 同一ログを空から同じシードで再生すると応答列は完全一致する。
 

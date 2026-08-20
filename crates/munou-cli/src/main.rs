@@ -130,6 +130,12 @@ struct Common {
     /// MMR λ for retrieve: λ·sim − (1−λ)·max redundancy. 1 = top-k cosine.
     #[arg(long)]
     mmr: Option<f32>,
+    /// Nucleus mass (LLM top-p analog). 1 = off (default; keeps interpolation tails).
+    #[arg(long, alias = "top-p")]
+    p_nucleus: Option<f64>,
+    /// Decode top-k after nucleus. 0 = off.
+    #[arg(long, alias = "top-k")]
+    k_top: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -145,8 +151,8 @@ fn main() -> Result<()> {
             let e = open(common)?;
             let s = e.stats();
             println!(
-                "utterances={} learned={} tokens={} vocab={} buf={} topic_k={}",
-                s.utterances, s.learned, s.tokens, s.vocab, s.buf, s.topic_window
+                "utterances={} learned={} tokens={} vocab={} buf={} topic_k={} meta={} hist={}",
+                s.utterances, s.learned, s.tokens, s.vocab, s.buf, s.topic_window, s.meta, s.hist
             );
             Ok(())
         }
@@ -229,6 +235,12 @@ fn params_from(c: &Common) -> Params {
     if let Some(m) = c.mmr {
         p.mmr_lambda = m.clamp(0.0, 1.0);
     }
+    if let Some(n) = c.p_nucleus {
+        p.p_nucleus = n.clamp(0.0, 1.0);
+    }
+    if let Some(k) = c.k_top {
+        p.k_top = k;
+    }
     if let Some(s) = &c.smoothing {
         p.smoothing = match s.to_ascii_lowercase().as_str() {
             "kn" | "kneser-ney" | "kneserney" => SmoothingKind::Kn,
@@ -271,7 +283,7 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
     let mut stdout = io::stdout();
     writeln!(
         stdout,
-        "人工無脳君  seed={}  /observe /why /stats /eval /rebuild /retok /explain /quit",
+        "人工無脳君  seed={}  /observe /why /good /bad /stats /eval /rebuild /retok /explain /quit",
         e.seed()
     )?;
     stdout.flush()?;
@@ -297,12 +309,14 @@ fn chat(c: Common, mut explain: bool) -> Result<()> {
                     writeln!(stdout, "(no trace yet)")?;
                 }
             }
+            "/good" => writeln!(stdout, "{}", e.feedback(true)?)?,
+            "/bad" => writeln!(stdout, "{}", e.feedback(false)?)?,
             "/stats" => {
                 let s = e.stats();
                 writeln!(
                     stdout,
-                    "utterances={} learned={} tokens={} vocab={} buf={}",
-                    s.utterances, s.learned, s.tokens, s.vocab, s.buf
+                    "utterances={} learned={} tokens={} vocab={} buf={} meta={}",
+                    s.utterances, s.learned, s.tokens, s.vocab, s.buf, s.meta
                 )?;
             }
             "/eval" => writeln!(stdout, "{}", e.eval_summary())?,

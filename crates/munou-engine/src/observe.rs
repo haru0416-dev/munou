@@ -79,6 +79,15 @@ pub struct Observe {
     pub rote_lean: bool,
     pub band_lo: f32,
     pub band_hi: f32,
+    /// Topic moving-average length (working-memory analog).
+    pub working: usize,
+    /// Non-meta log lines (episodic analog).
+    pub episodic: usize,
+    /// `/good` `/bad` lines (not corpus).
+    pub meta: usize,
+    /// Generation-context token queue.
+    pub hist: usize,
+    pub path_prior: [f32; 4],
 }
 
 impl Observe {
@@ -201,6 +210,11 @@ impl Observe {
             rote_lean,
             band_lo: params.band_lo,
             band_hi: params.band_hi,
+            working: stats.topic_window,
+            episodic: stats.episodic,
+            meta: stats.meta,
+            hist: stats.hist,
+            path_prior: stats.path_prior,
         }
     }
 
@@ -287,6 +301,17 @@ impl Observe {
             self.vocab,
             self.buf
         ));
+        s.push_str(&format!(
+            "記憶  作業={}  挿話={}  母数 tokens={} vocab={}  履歴={}  meta={}\n",
+            self.working, self.episodic, self.tokens, self.vocab, self.hist, self.meta
+        ));
+        if self.path_prior.iter().any(|x| *x != 0.0) {
+            let pr = self.path_prior;
+            s.push_str(&format!(
+                "好み  trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2}\n",
+                pr[0], pr[1], pr[2], pr[3]
+            ));
+        }
         s.push('\n');
         s.push_str(&format!(
             "吸収 {}  {:>3.0}%\n",
@@ -413,6 +438,7 @@ ul {{ padding-left: 1.2rem; }}
 <body>
 <h1>人工無脳君 観察窓 — {stage}{extra}</h1>
 <p>発話 {utt}　吸収 {learned} ({absorb_pct:.0}%)　tokens={tokens}　vocab={vocab}　buf={buf}</p>
+<p>記憶 作業={working}　挿話={episodic}　履歴={hist}　meta={meta}{pref}</p>
 <div class="row"><span class="lbl">吸収</span><div class="track"><div class="fill" style="width:{absorb_w}"></div></div><span class="val">{absorb_pct:.0}%</span></div>
 <div class="row"><span class="lbl">語彙</span><div class="track"><div class="fill" style="width:{vocab_w}"></div></div><span class="val">{vocab}</span></div>
 <div class="row"><span class="lbl">帯域</span><div class="track"><div class="fill" style="width:{band_fill}"></div></div><span class="val">{band_txt}</span></div>
@@ -430,6 +456,21 @@ ul {{ padding-left: 1.2rem; }}
             extra = extra,
             utt = self.utterances,
             learned = self.learned,
+            working = self.working,
+            episodic = self.episodic,
+            hist = self.hist,
+            meta = self.meta,
+            pref = {
+                let pr = self.path_prior;
+                if pr.iter().any(|x| *x != 0.0) {
+                    format!(
+                        "　好み trig={:+.2} mark={:+.2} retr={:+.2} echo={:+.2}",
+                        pr[0], pr[1], pr[2], pr[3]
+                    )
+                } else {
+                    String::new()
+                }
+            },
             absorb_pct = absorb_pct,
             absorb_w = absorb_w,
             tokens = self.tokens,
@@ -504,15 +545,30 @@ mod tests {
     use crate::eval::EvalAccum;
     use crate::params::Params;
 
-    fn empty_stats() -> Stats {
+    fn stats(
+        utterances: usize,
+        learned: usize,
+        tokens: usize,
+        vocab: usize,
+        buf: usize,
+        topic_window: usize,
+    ) -> Stats {
         Stats {
-            utterances: 0,
-            learned: 0,
-            tokens: 0,
-            vocab: 0,
-            buf: 0,
-            topic_window: 0,
+            utterances,
+            learned,
+            tokens,
+            vocab,
+            buf,
+            topic_window,
+            episodic: utterances,
+            meta: 0,
+            hist: 0,
+            path_prior: [0.0; 4],
         }
+    }
+
+    fn empty_stats() -> Stats {
+        stats(0, 0, 0, 0, 0, 0)
     }
 
     #[test]
@@ -529,20 +585,14 @@ mod tests {
         assert_eq!(o.absorb_rate, 0.0);
         let p = o.panel();
         assert!(p.contains("空"), "{p}");
+        assert!(p.contains("記憶"), "{p}");
         assert!(!p.is_empty());
         assert!(o.strip().contains("観察"));
     }
 
     #[test]
     fn logged_unlearned_is_not_sprout() {
-        let st = Stats {
-            utterances: 4,
-            learned: 0,
-            tokens: 0,
-            vocab: 0,
-            buf: 0,
-            topic_window: 0,
-        };
+        let st = stats(4, 0, 0, 0, 0, 0);
         let o = Observe::from_parts(&st, &Params::default(), &[], None, &EvalAccum::default());
         assert_eq!(o.stage, Stage::Logged);
         assert_eq!(o.stage.label(), "記録中");
@@ -550,14 +600,7 @@ mod tests {
 
     #[test]
     fn html_escapes_recent_lines() {
-        let st = Stats {
-            utterances: 2,
-            learned: 2,
-            tokens: 8,
-            vocab: 4,
-            buf: 0,
-            topic_window: 1,
-        };
+        let st = stats(2, 2, 8, 4, 0, 1);
         let rec = Record {
             v: 1,
             t: 0,
