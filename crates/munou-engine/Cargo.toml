@@ -1,0 +1,23 @@
+[package]
+name = "munou-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Closed, explainable, LLM-free dialogue engine (人工無脳君)"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rand = { workspace = true, features = ["small_rng"] }
+serde_json.workspace = true

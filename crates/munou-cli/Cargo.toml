@@ -1,0 +1,21 @@
+[package]
+name = "munou-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI adapter for the munou dialogue engine"
+
+[[bin]]
+name = "munou"
+path = "src/main.rs"
+
+[dependencies]
+munou-engine.workspace = true
+clap = { version = "=4.5.23", features = ["derive", "env"] }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
