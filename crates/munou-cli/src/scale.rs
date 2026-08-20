@@ -98,20 +98,25 @@ pub fn run(args: ScaleArgs) -> Result<()> {
         obs.stage.label()
     );
 
+    // Outer clock: `trace.elapsed_us` stops before log append / absorb /
+    // merge, so it can never show the synchronous SA-rebuild spike. This
+    // wall-clock number can.
     let mut times = Vec::new();
     println!(
         "{:<16} {:>6} {:>8} {:>8}  reply",
         "prompt", "path", "sim", "us"
     );
     for p in PROMPTS {
+        let t0 = Instant::now();
         let r = engine.respond(p)?;
-        times.push(r.trace.elapsed_us);
+        let us = t0.elapsed().as_micros();
+        times.push(us);
         println!(
             "{:<16} {:>6} {:>8.3} {:>8}  {}",
             trunc(p, 16),
             r.trace.path.tag(),
             r.trace.similarity,
-            r.trace.elapsed_us,
+            us,
             trunc(&r.text, 24)
         );
     }
@@ -120,7 +125,7 @@ pub fn run(args: ScaleArgs) -> Result<()> {
     let p99 = times[(times.len() * 99 / 100).min(times.len() - 1)];
     let max = *times.last().unwrap_or(&0);
     println!(
-        "respond   p50={p50}us  p99={p99}us  max={max}us  n={}",
+        "respond   p50={p50}us  p99={p99}us  max={max}us  n={}  (outer clock incl. log+absorb+merge)",
         times.len()
     );
     Ok(())

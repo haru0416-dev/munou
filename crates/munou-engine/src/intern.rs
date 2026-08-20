@@ -1,13 +1,17 @@
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{TokenId, BOS, EOS, FIRST_USER, SEP};
 
 /// String intern pool. User strings map onto dense `TokenId`s starting at [`FIRST_USER`].
+/// Each unique string is stored once (`Arc<str>` shared by map and table);
+/// the old `Box<str>` version kept two full copies.
 #[derive(Debug, Clone)]
 pub struct Interner {
-    to_id: FxHashMap<Box<str>, TokenId>,
-    to_str: Vec<Box<str>>,
+    to_id: FxHashMap<Arc<str>, TokenId>,
+    to_str: Vec<Arc<str>>,
 }
 
 impl Default for Interner {
@@ -22,10 +26,10 @@ impl Interner {
             to_id: FxHashMap::default(),
             to_str: Vec::new(),
         };
-        intern.to_str.resize(FIRST_USER as usize, Box::from(""));
-        intern.to_str[EOS as usize] = Box::from("<eos>");
-        intern.to_str[BOS as usize] = Box::from("<bos>");
-        intern.to_str[SEP as usize] = Box::from("<sep>");
+        intern.to_str.resize(FIRST_USER as usize, Arc::from(""));
+        intern.to_str[EOS as usize] = Arc::from("<eos>");
+        intern.to_str[BOS as usize] = Arc::from("<bos>");
+        intern.to_str[SEP as usize] = Arc::from("<sep>");
         intern
     }
 
@@ -34,9 +38,9 @@ impl Interner {
             return id;
         }
         let id = (self.to_str.len()) as TokenId;
-        let boxed: Box<str> = Box::from(s);
-        self.to_id.insert(boxed.clone(), id);
-        self.to_str.push(boxed);
+        let shared: Arc<str> = Arc::from(s);
+        self.to_id.insert(shared.clone(), id);
+        self.to_str.push(shared);
         id
     }
 
@@ -97,18 +101,18 @@ impl Interner {
             to_str: Vec::with_capacity(snap.strings.len().max(FIRST_USER as usize)),
         };
         for (i, s) in snap.strings.into_iter().enumerate() {
-            let boxed: Box<str> = Box::from(s.as_str());
-            if i >= FIRST_USER as usize && !boxed.is_empty() {
-                intern.to_id.insert(boxed.clone(), i as TokenId);
+            let shared: Arc<str> = Arc::from(s.as_str());
+            if i >= FIRST_USER as usize && !shared.is_empty() {
+                intern.to_id.insert(shared.clone(), i as TokenId);
             }
-            intern.to_str.push(boxed);
+            intern.to_str.push(shared);
         }
         while intern.to_str.len() < FIRST_USER as usize {
-            intern.to_str.push(Box::from(""));
+            intern.to_str.push(Arc::from(""));
         }
-        intern.to_str[EOS as usize] = Box::from("<eos>");
-        intern.to_str[BOS as usize] = Box::from("<bos>");
-        intern.to_str[SEP as usize] = Box::from("<sep>");
+        intern.to_str[EOS as usize] = Arc::from("<eos>");
+        intern.to_str[BOS as usize] = Arc::from("<bos>");
+        intern.to_str[SEP as usize] = Arc::from("<sep>");
         intern
     }
 }

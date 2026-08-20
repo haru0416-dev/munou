@@ -469,9 +469,16 @@ fn seed_live_latency_stays_in_budget() {
     let wall = t0.elapsed();
     times.sort_unstable();
     let p99 = times[(times.len() * 99 / 100).min(times.len() - 1)];
+    // 30ms is a release NFR (verify skips it in debug); debug + parallel
+    // test binaries only get a sanity bound.
+    let budget: u128 = if cfg!(debug_assertions) {
+        120_000
+    } else {
+        30_000
+    };
     assert!(
-        p99 < 30_000,
-        "p99={p99}us wall={wall:?} (design 30ms incl. embed)"
+        p99 < budget,
+        "p99={p99}us wall={wall:?} (design 30ms incl. embed; debug bound {budget}us)"
     );
     assert!(wall.as_millis() < 5_000, "80 turns wall {wall:?}");
     let _ = fs::remove_dir_all(&dir);

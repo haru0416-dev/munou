@@ -42,12 +42,28 @@ const PAIRS: &[(&str, &str)] = &[
     ("ありがとう", "いえいえ"),
 ];
 
+/// Syllabary for coined words. Closed and synthetic like the old ASCII turn
+/// index, but the grown vocabulary reads as Japanese — digit suffixes leaked
+/// into replies as 「ゲームしよう 4999」.
+const MORAE: &[&str] = &[
+    "か", "き", "く", "け", "こ", "さ", "し", "す", "そ", "た", "ち", "つ", "て", "と", "な", "に",
+    "ぬ", "ね", "の", "は", "ひ", "ふ", "へ", "ほ", "ま", "み", "む", "め", "も", "や", "ゆ", "よ",
+    "ら", "り", "る", "れ", "ろ", "わ",
+];
+
+fn coin_word(rng: &mut ChaCha8Rng) -> String {
+    let n = 2 + rng.gen_range(0..3); // 2..=4 morae
+    (0..n)
+        .map(|_| MORAE[rng.gen_range(0..MORAE.len())])
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FabricateOpts {
     /// Number of user/bot pairs (utterances = 2 × pairs).
     pub pairs: usize,
     pub rng_seed: u64,
-    /// Fraction of turns that append a turn index so vocab can grow.
+    /// Fraction of turns that append a coined kana word so vocab can grow.
     /// 0 = recycle the seed register only (huge count, small vocab).
     pub unique_frac: f64,
 }
@@ -90,7 +106,8 @@ fn push_pair(
     b: &str,
 ) {
     let (u, b) = if rng.gen::<f64>() < unique_frac {
-        (format!("{u} {i}"), format!("{b} {i}"))
+        let w = coin_word(rng);
+        (format!("{u} {w}"), format!("{b} {w}"))
     } else {
         (u.to_string(), b.to_string())
     };
@@ -135,6 +152,26 @@ pub fn write_jsonl(path: &Path, opts: FabricateOpts) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vocab growth must read as Japanese: no ASCII digits in any fabricated
+    /// text (the old turn-index suffix surfaced in replies as 「…しよう 4999」).
+    #[test]
+    fn unique_words_are_kana_not_digits() {
+        let recs = records(FabricateOpts {
+            pairs: 60,
+            rng_seed: 2,
+            unique_frac: 1.0,
+        });
+        assert!(recs
+            .iter()
+            .all(|r| !r.text.chars().any(|c| c.is_ascii_digit())));
+        let base: std::collections::HashSet<&str> =
+            PAIRS.iter().flat_map(|&(u, b)| [u, b]).collect();
+        assert!(
+            recs.iter().any(|r| !base.contains(r.text.as_str())),
+            "unique_frac=1 must actually grow the surface vocabulary"
+        );
+    }
 
     #[test]
     fn deterministic_and_even() {

@@ -62,6 +62,12 @@ pub struct Params {
     pub echo_penalty: f32,
     /// Subtracted × (token longest-common-substring with the *input* / len).
     pub rote_penalty: f32,
+    /// Subtracted × (longest run shared with a recent *own* reply / len).
+    /// Breaks the retrieve→absorb→retrieve lock-in loop; the input-side
+    /// rote penalty never saw the bot's own repetition.
+    pub self_penalty: f32,
+    /// How many recent bot replies the self-repetition penalty looks at.
+    pub self_window: usize,
     /// Added to topic cosine when the source is Trigger.
     pub trigger_bonus: f32,
     /// Extra Trigger score × pattern-input cosine (strong hits beat retrieve).
@@ -129,6 +135,8 @@ impl Default for Params {
             n_echo: 1,
             echo_penalty: 0.25,
             rote_penalty: 0.50,
+            self_penalty: 0.60,
+            self_window: 8,
             trigger_bonus: 0.10,
             trigger_match_weight: 1.0,
             retrieve_penalty: 0.20,
@@ -142,7 +150,28 @@ impl Default for Params {
 }
 
 impl Params {
+    /// Effective context cap: `l_max` as given, minimum 1. Earlier versions
+    /// silently clamped values above 8; the parameter is honoured now.
     pub fn l_max_capped(&self) -> usize {
-        self.l_max.clamp(1, 8)
+        self.l_max.max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn l_max_above_eight_is_honoured() {
+        let p = Params {
+            l_max: 12,
+            ..Params::default()
+        };
+        assert_eq!(p.l_max_capped(), 12);
+        let zero = Params {
+            l_max: 0,
+            ..Params::default()
+        };
+        assert_eq!(zero.l_max_capped(), 1);
     }
 }

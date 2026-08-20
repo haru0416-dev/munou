@@ -8,7 +8,9 @@ v0.1.3 — 観察窓が本線。アダプタ（伺か / Misskey / 常駐）は�
 v0.1.4 — 数理: 次数補間・Witten-Bell・帯域ヒンジ・Boltzmann slip・最長一致は連続部分列  
 v0.1.5 — LLM エコシステムの**概念**を閉じた構造へ逆輸入。API・重み・HuggingFace は使わない  
 v0.1.6 — 閉じた雑談ログを大量に複製して規模を試す。検索は直近 `n_retrieve_scan` 件  
-v0.1.8 — 育った語彙で 30ms 予算を守る。分布を「疎な明示 id + 尾部スカラー×unigram」で持ち、|V| の実体化を生成ステップから外す（分布同一・応答列は変わる）
+v0.1.8 — 育った語彙で 30ms 予算を守る。分布を「疎な明示 id + 尾部スカラー×unigram」で持ち、|V| の実体化を生成ステップから外す（分布同一・応答列は変わる）  
+v0.1.9 — 監査の修正。`Engine::open` を Θ(N) に（再生中の merge を止め最後に一回）、話題窓を live/replay で一致（user のみ）、KN の continuation / count-of-counts を buf 込みで即時更新、「ー」が CJK 隣接クラスを継承、trigger 埋め込みをロード時キャッシュ、fsync をターン 1 回に、`l_max` の 8 上限クランプを廃止  
+v0.1.10 — 対話実測からの調整。自己反復の抑制（直近 3 発話の完全一致をプールから除外 + 窓 `self_window` の文字 LCS 減点 `self_penalty`）、生成候補の先頭句読点トリム、rote 減点の分母を min(候補長, 入力長) に、fabricate の表層追加を ASCII 数字からかな造語に
 
 本文は元ドラフト。末尾にこのリポジトリで固定した決定だけを足す。
 
@@ -169,7 +171,9 @@ LLMを使わず、理解せずに会話が成立する対話プログラムを�
 | lambda_cache | 疎な文脈での recency cache 混合 | 0.10 |
 | ppm_exclude | Witten-Bell に PPM-C 除外を足す。KN は常に除外 | false |
 | echo_penalty | エコーの余弦減点 | 0.25 |
-| rote_penalty | 入力との連続部分列減点 | 0.50 |
+| rote_penalty | 入力との連続部分列減点。分母は min(候補長, 入力長) | 0.50 |
+| self_penalty | 直近の自分の発話との文字 LCS 減点（反復ループ抑制） | 0.60 |
+| self_window | 自己反復を見る直近 bot 発話数。完全一致は直近 3 件を候補から除外 | 8 |
 | band_penalty | 帯域外ヒンジの重み | 0.50 |
 | trigger_bonus | トリガー候補の加点 | 0.10 |
 | trigger_match_weight | パターン一致度をトリガー得点に乗せる | 1.0 |

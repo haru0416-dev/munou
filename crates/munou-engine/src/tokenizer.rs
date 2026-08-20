@@ -36,7 +36,8 @@ fn class(c: char) -> Class {
         '。' | '、' | '！' | '？' | '…' | '「' | '」' | '『' | '』' | '（' | '）' | '・' | 'ー'
     ) || c.is_ascii_punctuation()
     {
-        // prolonged sound mark is kept with katakana via the class of neighbours
+        // prolonged sound mark: base class Kata; `effective_classes` lets it
+        // inherit a CJK neighbour so らーめん is one run, not ら|ー|めん
         if c == 'ー' {
             Class::Kata
         } else {
@@ -201,11 +202,12 @@ impl Tokenizer {
             return Vec::new();
         }
         let n = char_idx.len();
+        let cls = effective_classes(&char_idx);
         let mut cuts = vec![false; n + 1];
         cuts[0] = true;
         cuts[n] = true;
         for i in 1..n {
-            if class(char_idx[i - 1].1) != class(char_idx[i].1) {
+            if cls[i - 1] != cls[i] {
                 cuts[i] = true;
             }
         }
@@ -213,8 +215,7 @@ impl Tokenizer {
             let codes: Vec<u32> = char_idx.iter().map(|(_, c)| *c as u32).collect();
             let mut scores = vec![0.0; n];
             for i in 0..n.saturating_sub(1) {
-                if class(char_idx[i].1) == class(char_idx[i + 1].1) && is_cjk(class(char_idx[i].1))
-                {
+                if cls[i] == cls[i + 1] && is_cjk(cls[i]) {
                     scores[i] = self.model.cut_score(&codes, i);
                 }
             }
@@ -229,8 +230,8 @@ impl Tokenizer {
                 }
             }
         } else {
-            for (i, &(_, c)) in char_idx.iter().enumerate() {
-                if is_cjk(class(c)) {
+            for (i, &c) in cls.iter().enumerate() {
+                if is_cjk(c) {
                     cuts[i] = true;
                     cuts[i + 1] = true;
                 }
@@ -273,6 +274,33 @@ impl Tokenizer {
 
 fn is_cjk(c: Class) -> bool {
     matches!(c, Class::Han | Class::Hira | Class::Kata)
+}
+
+/// True when every char is punctuation. Punctuation chunks are standalone
+/// tokens, so generation can start a reply with 「、」; the engine trims those.
+pub(crate) fn is_punct_str(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| class(c) == Class::Punct)
+}
+
+/// Per-char classes with the prolonged sound mark inheriting a CJK
+/// neighbour's class (preferring the left one). The plain `class` pinned ー
+/// to katakana, which forced boundary cuts like ら|ー|めん forever, no
+/// matter what the entropy model had learned.
+fn effective_classes(char_idx: &[(usize, char)]) -> Vec<Class> {
+    let mut cls: Vec<Class> = char_idx.iter().map(|&(_, c)| class(c)).collect();
+    for i in 0..cls.len() {
+        if char_idx[i].1 != 'ー' {
+            continue;
+        }
+        let prev = if i > 0 { Some(cls[i - 1]) } else { None };
+        let next = char_idx.get(i + 1).map(|&(_, c)| class(c));
+        cls[i] = match (prev, next) {
+            (Some(p), _) if is_cjk(p) => p,
+            (_, Some(nx)) if is_cjk(nx) => nx,
+            _ => Class::Kata,
+        };
+    }
+    cls
 }
 
 fn chunk_intern(intern: &mut Interner, morphs: &[TokenId], k: usize) -> Vec<TokenId> {
@@ -350,6 +378,26 @@ mod tests {
         }
         let morphs = tok.morphemes(corpus);
         assert!(morphs.len() > 3, "got {morphs:?}");
+    }
+
+    /// ー between hiragana must not force class-boundary cuts; with a trained
+    /// model and zero in-word branching entropy, らーめん stays one morpheme.
+    /// The old class table pinned ー to katakana and split ら|ー|めん forever.
+    #[test]
+    fn prolonged_mark_joins_neighbouring_run() {
+        let mut tok = Tokenizer::new(&Params::default());
+        for _ in 0..80 {
+            tok.observe("らーめんたべたい。らーめんおいしい。");
+        }
+        let morphs = tok.morphemes("らーめん");
+        assert!(
+            morphs.iter().all(|m| m != "ー"),
+            "ー must not be a lone morpheme: {morphs:?}"
+        );
+        assert!(
+            morphs.iter().any(|m| m.contains("らー")),
+            "run should cross the prolonged mark: {morphs:?}"
+        );
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct Store {
     unigram: FxHashMap<TokenId, u32>,
     /// Continuation counts: number of unique left contexts per token (KN unigram).
     continuation: FxHashMap<TokenId, u32>,
+    /// Bigram counts over body+buf, kept incrementally so `continuation` and
+    /// the count-of-counts below include buffered utterances (they used to be
+    /// stale until the next merge).
+    bigrams: FxHashMap<(TokenId, TokenId), u32>,
     /// Bigram count-of-counts n1..n4 for Chen-Goodman modified KN.
     bigram_n1: u64,
     bigram_n2: u64,
@@ -67,6 +71,11 @@ impl Store {
         if chunks.is_empty() {
             return;
         }
+        let prev_last = self
+            .buf
+            .last()
+            .copied()
+            .or_else(|| self.text.last().copied());
         self.buf.push(SEP);
         for &t in chunks {
             self.buf.push(t);
@@ -78,13 +87,66 @@ impl Store {
             let start = self.buf.len().saturating_sub(chunks.len() + 2);
             let slice = self.buf[start..].to_vec();
             self.bump_unigram_slice(&slice);
+            self.bump_bigram_slice(prev_last, &slice);
             self.invalidate_unigram_caches();
         }
+    }
+
+    /// Append without stats or merging. For log replay only: no lookups happen
+    /// until the single final `merge`, whose recompute makes the end state
+    /// identical to per-utterance pushes — without rebuilding the SA every
+    /// `merge_threshold` tokens (that made `Engine::open` quadratic in N).
+    pub(crate) fn push_utterance_deferred(&mut self, chunks: &[TokenId]) {
+        if chunks.is_empty() {
+            return;
+        }
+        self.buf.push(SEP);
+        self.buf.extend_from_slice(chunks);
+        self.buf.push(EOS);
+        self.invalidate_unigram_caches();
     }
 
     fn bump_unigram_slice(&mut self, slice: &[TokenId]) {
         for &t in slice {
             *self.unigram.entry(t).or_insert(0) += 1;
+        }
+    }
+
+    fn bump_bigram_slice(&mut self, prev_last: Option<TokenId>, slice: &[TokenId]) {
+        if let (Some(l), Some(&w)) = (prev_last, slice.first()) {
+            self.bump_bigram(l, w);
+        }
+        for pair in slice.windows(2) {
+            self.bump_bigram(pair[0], pair[1]);
+        }
+    }
+
+    /// One bigram observation: move its count-of-counts bin and, on first
+    /// sight, the continuation count. Matches `recompute_stats` bin for bin.
+    fn bump_bigram(&mut self, l: TokenId, w: TokenId) {
+        let c = self.bigrams.entry((l, w)).or_insert(0);
+        *c += 1;
+        match *c {
+            1 => {
+                *self.continuation.entry(w).or_insert(0) += 1;
+                self.bigram_n1 += 1;
+            }
+            2 => {
+                self.bigram_n1 -= 1;
+                self.bigram_n2 += 1;
+            }
+            3 => {
+                self.bigram_n2 -= 1;
+                self.bigram_n3 += 1;
+            }
+            4 => {
+                self.bigram_n3 -= 1;
+                self.bigram_n4 += 1;
+            }
+            5 => {
+                self.bigram_n4 -= 1;
+            }
+            _ => {}
         }
     }
 
@@ -94,6 +156,9 @@ impl Store {
         }
         self.text.extend_from_slice(&self.buf);
         self.buf.clear();
+        // Replay can leave a corpus-sized capacity behind; keep one
+        // generation's worth.
+        self.buf.shrink_to(self.merge_threshold);
         self.rebuild_index();
     }
 
@@ -104,30 +169,28 @@ impl Store {
 
     fn recompute_stats(&mut self) {
         self.invalidate_unigram_caches();
-        self.unigram.clear();
+        // One pass over text⧺buf with a `prev` cursor — no stream copy.
+        let mut unigram = std::mem::take(&mut self.unigram);
+        let mut bigrams = std::mem::take(&mut self.bigrams);
+        unigram.clear();
+        bigrams.clear();
+        let mut prev: Option<TokenId> = None;
+        for &t in self.text.iter().chain(self.buf.iter()) {
+            *unigram.entry(t).or_insert(0) += 1;
+            if let Some(l) = prev {
+                *bigrams.entry((l, t)).or_insert(0) += 1;
+            }
+            prev = Some(t);
+        }
+        self.unigram = unigram;
+        // continuation(w) = unique left contexts = distinct (·,w) bigram keys.
         self.continuation.clear();
         self.bigram_n1 = 0;
         self.bigram_n2 = 0;
         self.bigram_n3 = 0;
         self.bigram_n4 = 0;
-        for &t in self.text.iter().chain(self.buf.iter()) {
-            *self.unigram.entry(t).or_insert(0) += 1;
-        }
-        // unique left contexts of each token in the body
-        let mut seen: FxHashMap<TokenId, FxHashMap<TokenId, ()>> = FxHashMap::default();
-        let stream: Vec<TokenId> = self.text.iter().chain(self.buf.iter()).copied().collect();
-        let mut bigrams: FxHashMap<(TokenId, TokenId), u32> = FxHashMap::default();
-        for i in 1..stream.len() {
-            let left = stream[i - 1];
-            let w = stream[i];
-            seen.entry(w).or_default().insert(left, ());
-            *bigrams.entry((left, w)).or_insert(0) += 1;
-        }
-        self.continuation = seen
-            .into_iter()
-            .map(|(w, lefts)| (w, lefts.len() as u32))
-            .collect();
-        for &c in bigrams.values() {
+        for (&(_, w), &c) in &bigrams {
+            *self.continuation.entry(w).or_insert(0) += 1;
             match c {
                 1 => self.bigram_n1 += 1,
                 2 => self.bigram_n2 += 1,
@@ -136,6 +199,7 @@ impl Store {
                 _ => {}
             }
         }
+        self.bigrams = bigrams;
     }
 
     /// Chen-Goodman D1/D2/D3+ from this corpus. Not an ARPA / KenLM file.
@@ -171,6 +235,31 @@ impl Store {
         if let Some((lo, hi)) = sa_range(&self.text, &self.sa, ctx) {
             let off = ctx.len();
             let n = self.text.len();
+            if hi - lo <= 64 {
+                // Small ranges: one linear pass beats per-run binary search.
+                // Next tokens appear as ascending contiguous runs, so run-length
+                // counting yields the same id-sorted list as the branch below.
+                let mut cur: Option<(TokenId, u32)> = None;
+                for &p in &self.sa[lo..hi] {
+                    let j = p as usize + off;
+                    if j >= n {
+                        continue;
+                    }
+                    let t = self.text[j];
+                    cur = match cur {
+                        Some((tc, c)) if tc == t => Some((tc, c + 1)),
+                        Some(done) => {
+                            body.push(done);
+                            Some((t, 1))
+                        }
+                        None => Some((t, 1)),
+                    };
+                }
+                if let Some(done) = cur {
+                    body.push(done);
+                }
+                return self.finish_counts(body, ctx);
+            }
             let mut r = lo;
             // The suffix equal to `ctx` at end-of-text sorts first; it has no next token.
             while r < hi && self.sa[r] as usize + off >= n {
@@ -193,6 +282,15 @@ impl Store {
                 r = a;
             }
         }
+        self.finish_counts(body, ctx)
+    }
+
+    /// Fold the generation buffer into the SA-body counts.
+    fn finish_counts(
+        &self,
+        body: Vec<(TokenId, u32)>,
+        ctx: &[TokenId],
+    ) -> (Vec<(TokenId, u32)>, u32) {
         let mut acc: FxHashMap<TokenId, u32> = FxHashMap::default();
         count_linear(&self.buf, ctx, &mut acc);
         if acc.is_empty() {
@@ -361,6 +459,83 @@ mod tests {
         assert!(total >= 2);
         let ids: Vec<TokenId> = c.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&12) || ids.contains(&13));
+    }
+
+    /// Incremental (buffered) stats must equal a from-scratch recompute over
+    /// the same stream — KN continuation and count-of-counts are no longer
+    /// stale between merges.
+    #[test]
+    fn incremental_stats_match_recompute() {
+        let mut a = Store::new(1024); // stays buffered
+        let mut b = Store::new(1024);
+        let utts: Vec<Vec<TokenId>> = vec![
+            vec![20, 21, 22],
+            vec![20, 21],
+            vec![23, 20, 21, 22],
+            vec![24],
+            vec![20, 21, 22],
+        ];
+        for u in &utts {
+            a.push_utterance(u);
+            b.push_utterance(u);
+        }
+        b.merge();
+        assert_eq!(a.bigram_count_of_counts(), b.bigram_count_of_counts());
+        assert_eq!(a.continuation_unigram(), b.continuation_unigram());
+        assert_eq!(a.unigram_counts(), b.unigram_counts());
+    }
+
+    /// Deferred replay pushes + one final merge must be bit-identical to
+    /// per-utterance pushes with periodic merges.
+    #[test]
+    fn deferred_replay_equals_incremental_pushes() {
+        let mut a = Store::new(8); // tiny threshold → many merges on the way
+        let mut b = Store::new(8);
+        let mut utts: Vec<Vec<TokenId>> = Vec::new();
+        for i in 0..50u32 {
+            utts.push(vec![20 + i % 7, 30 + i % 5, 40 + i % 3]);
+        }
+        for u in &utts {
+            a.push_utterance(u);
+        }
+        a.merge();
+        for u in &utts {
+            b.push_utterance_deferred(u);
+        }
+        b.merge();
+        assert_eq!(a.text, b.text);
+        assert_eq!(a.sa, b.sa);
+        assert_eq!(a.unigram_counts(), b.unigram_counts());
+        assert_eq!(a.continuation_unigram(), b.continuation_unigram());
+        assert_eq!(a.bigram_count_of_counts(), b.bigram_count_of_counts());
+    }
+
+    fn naive_counts(s: &Store, ctx: &[TokenId]) -> (Vec<(TokenId, u32)>, u32) {
+        let mut acc: FxHashMap<TokenId, u32> = FxHashMap::default();
+        count_linear(&s.text, ctx, &mut acc);
+        count_linear(&s.buf, ctx, &mut acc);
+        let total: u32 = acc.values().copied().sum();
+        let mut v: Vec<(TokenId, u32)> = acc.into_iter().collect();
+        v.sort_by_key(|(id, _)| *id);
+        (v, total)
+    }
+
+    /// The small-range linear path and the run-binary-search path must both
+    /// match a naive window scan.
+    #[test]
+    fn next_counts_linear_and_binary_paths_agree() {
+        let mut s = Store::new(32);
+        for i in 0..100u32 {
+            s.push_utterance(&[50, 51, 52 + (i % 3)]);
+        }
+        s.push_utterance(&[60, 61, 62]);
+        s.merge();
+        for ctx in [vec![50u32, 51], vec![60, 61], vec![51]] {
+            let (got, total) = s.next_counts(&ctx);
+            let (want, wtotal) = naive_counts(&s, &ctx);
+            assert_eq!(got, want, "ctx={ctx:?}");
+            assert_eq!(total, wtotal, "ctx={ctx:?}");
+        }
     }
 
     #[test]

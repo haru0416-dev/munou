@@ -4,6 +4,20 @@
 //! selection (closed hash embeddings + slip). Trigger, retrieve, Markov, and
 //! echo propose into one pool. Nothing here calls a network or a pretrained
 //! generative model.
+//!
+//! Module map (boxes from design §3):
+//!
+//! | 設計の箱 | モジュール |
+//! |---|---|
+//! | トークナイザー（分岐エントロピー + AV） | `tokenizer`, `intern` |
+//! | コーパスストア（u32 列 + SA-IS + unigram キャッシュ） | `store`, `sais` |
+//! | マルコフ生成（dense 参照実装 / 疎表現の本番経路） | `generate`, `sparse`, `alias`, `smoothing` |
+//! | トリガー / 検索 / エコー | `trigger`, `retrieve`（エコーは `engine` 内） |
+//! | 候補プールと経路ゲート | `mix`, `route` |
+//! | 選択器（話題余弦・帯域ヒンジ・slip） | `select`, `embed` |
+//! | 記憶（append-only JSONL・吸収・再生） | `log`, `engine` |
+//! | 観察窓・説明・評価 | `observe`, `explain`, `eval` |
+//! | 大量ログの合成 | `fabricate` |
 
 mod alias;
 mod embed;
@@ -19,10 +33,12 @@ mod log;
 mod mix;
 mod observe;
 mod params;
+mod retrieve;
 mod route;
 mod sais;
 mod select;
 mod smoothing;
+mod sparse;
 mod store;
 mod tokenizer;
 mod trigger;

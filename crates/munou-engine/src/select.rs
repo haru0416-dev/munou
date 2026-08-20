@@ -27,6 +27,10 @@ pub struct RankInput<'a> {
     pub tokens: &'a [Vec<TokenId>],
     pub sources: &'a [PathKind],
     pub input_tokens: &'a [TokenId],
+    /// Recent own reply texts (newest last); candidates repeating them lose
+    /// score. Char-level on purpose: token ids drift across reopen
+    /// (re-tokenised text vs generation chunks), text does not.
+    pub recent_bot: &'a [String],
     /// Pattern-input cosine of the trigger hit, or 0.
     pub trigger_match: f32,
     /// Closed analog of RLHF: additive logit on PathKind from `/good` `/bad`.
@@ -40,6 +44,17 @@ pub fn source_bias(source: PathKind, params: &Params, trigger_match: f32) -> f32
         PathKind::Retrieve => -params.retrieve_penalty,
         PathKind::Echo => -params.echo_penalty,
     }
+}
+
+/// Longest shared contiguous run over the shorter side's length. 1.0 means
+/// one side contains the other whole. Works on token ids or chars-as-u32.
+fn overlap_ratio(a: &[u32], b: &[u32]) -> f32 {
+    let denom = a.len().min(b.len()).max(1) as f32;
+    lcsubstr_len(a, b) as f32 / denom
+}
+
+fn chars_u32(s: &str) -> Vec<u32> {
+    s.chars().map(|c| c as u32).collect()
 }
 
 /// Hinge loss against the similarity band. Zero inside `[lo, hi]`.
@@ -61,18 +76,27 @@ pub fn rank_and_pick<R: Rng + ?Sized, E: Embedder>(
 ) -> Ranked {
     let dim = embedder.dim();
     let mut buf = vec![0.0f32; dim];
+    let recent_chars: Vec<Vec<u32>> = input.recent_bot.iter().map(|t| chars_u32(t)).collect();
     let mut scored: Vec<(usize, f32, f32)> = Vec::with_capacity(input.texts.len());
     for (i, t) in input.texts.iter().enumerate() {
         embedder.embed(t, &mut buf);
         let topic_s = cosine(input.topic, &buf);
         let source = input.sources.get(i).copied().unwrap_or(PathKind::Markov);
         let toks = input.tokens.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
-        let denom = toks.len().max(1) as f32;
-        let rote = params.rote_penalty * (lcsubstr_len(toks, input.input_tokens) as f32 / denom);
+        // min-length denominator: a long candidate that swallows the whole
+        // input whole is a full copy, not a diluted one.
+        let rote = params.rote_penalty * overlap_ratio(toks, input.input_tokens);
+        let cand_chars = chars_u32(t);
+        let self_rote = params.self_penalty
+            * recent_chars
+                .iter()
+                .map(|prev| overlap_ratio(&cand_chars, prev))
+                .fold(0.0f32, f32::max);
         let score = topic_s
             + source_bias(source, params, input.trigger_match)
             + input.path_prior[crate::route::prior_index(source)]
             - rote
+            - self_rote
             - params.band_penalty * band_hinge(topic_s, params.band_lo, params.band_hi);
         scored.push((i, score, topic_s));
     }
@@ -139,6 +163,7 @@ mod tests {
                 tokens: &toks,
                 sources: &sources,
                 input_tokens: &[],
+                recent_bot: &[],
                 trigger_match: 0.0,
                 path_prior: [0.0; 4],
             },
@@ -170,6 +195,7 @@ mod tests {
                 tokens: &toks,
                 sources: &sources,
                 input_tokens: &[7, 8],
+                recent_bot: &[],
                 trigger_match: 1.0,
                 path_prior: [0.0; 4],
             },
@@ -179,6 +205,55 @@ mod tests {
         assert_eq!(
             r.traces.iter().find(|c| c.chosen).unwrap().source,
             PathKind::Trigger
+        );
+    }
+
+    /// A candidate identical to a recent own reply must lose to a fresh one
+    /// of comparable topic score — the lock-in loop breaker.
+    #[test]
+    fn repeating_own_recent_reply_loses() {
+        let e = HashEmbedder::new(64);
+        let mut topic = vec![0.0; 64];
+        e.embed("散歩の話", &mut topic);
+        let texts = vec!["散歩しよう".into(), "公園まで歩こうか".into()];
+        let toks: Vec<Vec<u32>> = vec![vec![21], vec![22, 23]];
+        let sources = vec![PathKind::Markov, PathKind::Markov];
+        let params = Params {
+            p_slip: 0.0,
+            ..Params::default()
+        };
+        let recent: Vec<String> = vec!["散歩しよう".into()]; // just said it
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
+        let r = rank_and_pick(
+            &e,
+            RankInput {
+                topic: &topic,
+                texts: &texts,
+                tokens: &toks,
+                sources: &sources,
+                input_tokens: &[],
+                recent_bot: &recent,
+                trigger_match: 0.0,
+                path_prior: [0.0; 4],
+            },
+            &params,
+            &mut rng,
+        );
+        let chosen = r.traces.iter().find(|c| c.chosen).unwrap();
+        assert_eq!(
+            chosen.text, "公園まで歩こうか",
+            "exact repeat of a recent reply must not win"
+        );
+    }
+
+    /// The rote denominator is min(len): padding a full copy of the input
+    /// with extra tokens must not dilute the penalty below the plain copy's.
+    #[test]
+    fn rote_penalty_not_diluted_by_padding() {
+        assert!((overlap_ratio(&[7, 8], &[7, 8]) - 1.0).abs() < 1e-6);
+        assert!(
+            (overlap_ratio(&[7, 8, 9, 10, 11, 12], &[7, 8]) - 1.0).abs() < 1e-6,
+            "long candidate containing the whole input is still a full copy"
         );
     }
 

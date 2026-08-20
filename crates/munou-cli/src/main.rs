@@ -152,6 +152,9 @@ struct Common {
     /// Band-hinge weight on the selector.
     #[arg(long)]
     band_penalty: Option<f32>,
+    /// Penalty × overlap with the bot's own recent replies. 0 disables.
+    #[arg(long)]
+    self_penalty: Option<f32>,
     /// Smoothing: naive (Witten-Bell) | kn (modified Kneser-Ney; not KenLM)
     #[arg(long)]
     smoothing: Option<String>,
@@ -306,6 +309,9 @@ fn params_from(c: &Common) -> Params {
     }
     if let Some(b) = c.band_penalty {
         p.band_penalty = b.max(0.0);
+    }
+    if let Some(s) = c.self_penalty {
+        p.self_penalty = s.max(0.0);
     }
     if let Some(m) = c.mmr {
         p.mmr_lambda = m.clamp(0.0, 1.0);
