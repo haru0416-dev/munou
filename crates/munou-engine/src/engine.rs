@@ -1028,7 +1028,6 @@ impl Engine {
                 self.propose_echo(&mut pool, tok);
             }
         }
-
         // Exact self-repeats of the newest three replies are dropped: with
         // a bad pool the least-bad repeat otherwise wins. Not the full
         // window — that drops seed-scale band 67→42%. Triggers are exempt;
