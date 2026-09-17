@@ -51,7 +51,7 @@ mod tokenizer;
 mod trigger;
 mod weather;
 
-pub use engine::{Engine, OpenConfig, Reply, Stats};
+pub use engine::{Engine, History, HistoryInterest, OpenConfig, Reply, Stats};
 pub use error::{Error, Result};
 pub use eval::EvalAccum;
 pub use explain::{CandidateTrace, GenStep, PathKind, Trace, TriggerTrace};

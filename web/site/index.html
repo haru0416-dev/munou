@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>人工無脳君</title>
-<meta name="description" content="LLMを使わない、閉じた決定的対話エンジン。すべてブラウザ内で動く。">
+<meta name="description" content="LLMを使わず、ブラウザ内で動く会話プログラム。会話の記録から言葉を学習します。">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext x='0' y='13' font-size='13'%3E%F0%9F%8C%B1%3C/text%3E%3C/svg%3E">
 <style>
 :root {
   --bg: #10130f;
   --panel: #181c16;
   --ink: #d6d3c4;
-  --dim: #7d8272;
+  --dim: #a0a58f;
   --user: #9ec49a;
   --bot: #d6d3c4;
   --accent: #3c5a41;
@@ -21,24 +21,29 @@
 html, body { height: 100%; }
 body {
   margin: 0;
-  font: 15px/1.6 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font: 15px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
   background: var(--bg);
   color: var(--ink);
   display: flex;
   flex-direction: column;
 }
-header {
+body > header {
   display: flex; flex-wrap: wrap; gap: .5rem; align-items: center;
   padding: .6rem .9rem;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
-header h1 { font-size: 1rem; margin: 0 auto 0 0; font-weight: 700; }
-header label { color: var(--dim); font-size: .8rem; }
-header input[type="number"] {
-  width: 5.5em; background: var(--bg); color: var(--ink);
-  border: 1px solid var(--line); border-radius: 4px; padding: .15rem .35rem;
-  font: inherit; font-size: .85rem;
+body > header h1 { font-size: 1rem; margin: 0 auto 0 0; font-weight: 700; }
+.settings { font-size: .85rem; min-width: 0; max-width: 100%; }
+.settings summary { cursor: pointer; padding: .25rem .6rem; }
+.settings label { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.settings p { margin: .35rem 0 0; color: var(--dim); }
+.settings-content { padding: .5rem .6rem; }
+.settings input[type="number"] {
+  width: 7em; max-width: 100%; min-width: 0;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 4px; padding: .25rem .35rem;
+  font: inherit;
 }
 button {
   background: var(--bg); color: var(--ink);
@@ -46,58 +51,111 @@ button {
   padding: .25rem .6rem; font: inherit; font-size: .85rem; cursor: pointer;
 }
 button:hover { border-color: var(--accent); }
-main { flex: 1; overflow-y: auto; padding: 1rem .9rem 0; scroll-behavior: smooth; }
-.chat { max-width: 46rem; margin: 0 auto; display: flex; flex-direction: column; gap: .45rem; }
+button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible {
+  outline: 2px solid var(--user); outline-offset: 3px;
+}
+button:disabled { cursor: default; opacity: .6; }
+main { flex: 1; min-height: 0; overflow-y: auto; padding: 1rem .9rem 0; }
+.chat { max-width: 46rem; min-width: 0; margin: 0 auto; padding-bottom: 1rem; display: flex; flex-direction: column; gap: .45rem; }
 .msg { white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.user { color: var(--user); }
 .msg.user::before { content: "> "; color: var(--dim); }
 .msg.bot { color: var(--bot); }
 .msg.note { color: var(--dim); font-size: .8rem; }
-.msg.strip { color: var(--dim); font-size: .74rem; border-bottom: 1px dashed var(--line); padding-bottom: .45rem; }
-pre.panel {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-  padding: .7rem .8rem; font-size: .78rem; overflow-x: auto; margin: .2rem 0;
-  white-space: pre;
+.observation, .panel {
+  min-width: 0; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: .7rem .8rem; margin: .2rem 0;
+  overflow-wrap: anywhere;
 }
+.observation-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem .7rem; margin-bottom: .6rem; }
+.observation-head h2 { margin: 0; font-size: .9rem; }
+.observation-stage { color: var(--user); font-size: .8rem; }
+.metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .8rem; }
+.metric { min-width: 0; }
+.metric-label { color: var(--dim); font-size: .75rem; }
+.metric-value { display: block; font-size: .95rem; font-variant-numeric: tabular-nums; }
+.metric-description { margin: .3rem 0 0; color: var(--dim); font-size: .75rem; }
+.compact .metric-description { display: none; }
+.full .metric-description { display: block; }
+.full .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.metric-track { height: .375rem; width: 100%; overflow: hidden; border-radius: 3px; background: var(--line); margin-top: .35rem; }
+.metric-fill { height: 100%; max-width: 100%; border-radius: inherit; background: var(--user); }
+.panel-title { margin: 0 0 .5rem; font-size: .95rem; }
+.panel-note { margin: .4rem 0; color: var(--dim); font-size: .8rem; }
+.facts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: .35rem .8rem; margin: .6rem 0; font-size: .8rem; }
+.facts dt { color: var(--dim); }
+.facts dd { margin: 0; min-width: 0; }
+.record-list { margin: .6rem 0; padding-left: 1.2rem; font-size: .8rem; }
+.record-list li + li { margin-top: .3rem; }
+.record-section h3 { margin: .9rem 0 .35rem; font-size: .85rem; font-weight: 600; }
+.candidate { min-width: 0; padding: .55rem .65rem; margin-top: .5rem; border: 1px solid var(--line); border-radius: 4px; font-size: .85rem; }
+.candidate.chosen { border-color: var(--user); background: var(--bg); }
+.candidate p { margin: .2rem 0; }
 form {
+  min-width: 0;
   display: flex; gap: .5rem; padding: .7rem .9rem calc(.7rem + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line); background: var(--panel);
 }
 form input[type="text"] {
-  flex: 1; max-width: 46rem; margin-left: auto;
+  flex: 1; min-width: 0; max-width: 46rem; margin-left: auto;
   background: var(--bg); color: var(--ink);
   border: 1px solid var(--line); border-radius: 6px;
   padding: .5rem .7rem; font: inherit;
 }
-form input[type="text"]:focus { outline: 1px solid var(--accent); }
-form button { margin-right: auto; }
+form button { flex-shrink: 0; margin-right: auto; }
 .intro { color: var(--dim); font-size: .8rem; }
 .intro a { color: var(--user); }
+@media (max-width: 40rem) {
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body > header { gap: .4rem; padding: .6rem; }
+  body > header h1 { flex-basis: 100%; }
+  main { padding: .7rem .6rem 0; }
+  form { padding: .6rem .6rem calc(.6rem + env(safe-area-inset-bottom)); }
+}
+@media (max-width: 24rem) {
+  body > header button { padding: .3rem .45rem; font-size: .8rem; }
+  .observation, .panel { padding: .6rem; }
+  .metrics { gap: .65rem; }
+  .facts { grid-template-columns: minmax(0, 1fr); gap: .15rem; }
+  .facts dd { margin-bottom: .4rem; }
+}
+@media (max-width: 16rem) {
+  .metrics, .full .metrics { grid-template-columns: minmax(0, 1fr); }
+  form { flex-wrap: wrap; }
+  form input[type="text"] { flex-basis: 100%; }
+  form button { margin-left: auto; margin-right: 0; }
+}
 </style>
 </head>
 <body>
 <header>
   <h1>人工無脳君</h1>
-  <label>seed <input id="seed" type="number" value="1" min="0" step="1" inputmode="numeric"></label>
-  <button id="btn-observe" type="button">観察窓</button>
-  <button id="btn-ayumi" type="button">あゆみ</button>
-  <button id="btn-why" type="button">/why</button>
-  <button id="btn-good" type="button">/good</button>
-  <button id="btn-bad" type="button">/bad</button>
+  <button id="btn-observe" type="button">会話のようす</button>
+  <button id="btn-history" type="button">これまでの記録</button>
+  <button id="btn-why" type="button">返答の理由</button>
+  <button id="btn-good" type="button">この返しが好き</button>
+  <button id="btn-bad" type="button">別の返しがいい</button>
   <button id="btn-reset" type="button">リセット</button>
+  <details class="settings">
+    <summary>設定</summary>
+    <div class="settings-content">
+      <label for="seed">乱数シード <input id="seed" type="number" value="1" min="0" step="1" inputmode="numeric" aria-describedby="seed-note"></label>
+      <p id="seed-note">変更は次にページを読み込んだときに反映されます。</p>
+    </div>
+  </details>
 </header>
 <main>
   <div class="chat" id="chat" aria-live="polite">
-    <p class="intro">LLMなし・サーバなし。エンジンは WebAssembly でこのページ内だけで動き、
-会話ログは端末の localStorage に残ります（外に出ません）。話しかけるほど、あなたのログから育ちます。
-<a href="https://github.com/haru0416-dev/munou">ソース</a></p>
+    <p class="intro">LLMを使わず、このブラウザ内で動く会話プログラムです。
+会話の記録から言葉を学習します。記録はブラウザに保存され、サーバーには送信されません。
+<a href="https://github.com/haru0416-dev/munou">ソースコード</a></p>
   </div>
 </main>
 <form id="form">
   <input id="input" type="text" autocomplete="off" enterkeyhint="send"
-         placeholder="話しかける…" aria-label="発話入力" disabled>
+         placeholder="メッセージを入力" aria-label="メッセージ" disabled>
   <button type="submit" id="send" disabled>送信</button>
 </form>
-<script src="app.js"></script>
+<script src="app.js?v=2"></script>
 </body>
 </html>

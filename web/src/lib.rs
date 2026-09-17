@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 
-use munou_engine::{set_now_ms, Engine, Params};
+use munou_engine::{set_now_ms, Engine, Observe, Params, Stage};
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
@@ -29,7 +29,7 @@ fn set_out(s: String) {
 fn with_engine<F: FnOnce(&mut Engine) -> Result<String, String>>(f: F) -> i32 {
     ENGINE.with(|e| match e.borrow_mut().as_mut() {
         None => {
-            set_out("engine not initialised".into());
+            set_out("まだ準備ができていません。".into());
             1
         }
         Some(eng) => match f(eng) {
@@ -42,6 +42,47 @@ fn with_engine<F: FnOnce(&mut Engine) -> Result<String, String>>(f: F) -> i32 {
                 1
             }
         },
+    })
+}
+
+fn observation_json(o: Observe) -> serde_json::Value {
+    let stage = match o.stage {
+        Stage::Empty => "empty",
+        Stage::Logged => "logged",
+        Stage::Sprout => "sprout",
+        Stage::Growing => "growing",
+        Stage::Dense => "dense",
+    };
+    serde_json::json!({
+        "stage": stage,
+        "utterances": o.utterances,
+        "learned": o.learned,
+        "tokens": o.tokens,
+        "vocab": o.vocab,
+        "absorb_rate": o.absorb_rate,
+        "eval_n": o.eval_n,
+        "band_hit_pct": o.band_hit_pct,
+        "rote_lcs": o.rote_lcs,
+        "slip_pct": o.slip_pct,
+        "band_lo": o.band_lo,
+        "band_hi": o.band_hi,
+        "last_path": o.last_path,
+        "last_learned": o.last_learned,
+        "last_slipped": o.last_slipped,
+        "last_sim": o.last_sim,
+        "recent_learned_bot": o.recent_learned_bot,
+        "paths": {
+            "trigger": o.path_trig,
+            "markov": o.path_mark,
+            "retrieve": o.path_retr,
+            "echo": o.path_echo,
+            "adapt": o.path_adpt,
+        },
+        "working": o.working,
+        "hist": o.hist,
+        "meta": o.meta,
+        "path_prior": o.path_prior,
+        "rote_lean": o.rote_lean,
     })
 }
 
@@ -104,43 +145,65 @@ pub extern "C" fn load_triggers() -> i32 {
 }
 
 /// One turn: input text in IN, reply JSON in OUT
-/// ({interject, text, milestone, strip, why}).
+/// ({interject, text, milestone, observation}).
 #[no_mangle]
 pub extern "C" fn respond() -> i32 {
     let input = take_in();
     with_engine(|e| {
         let r = e.respond(&input).map_err(|err| err.to_string())?;
-        let strip = e.observe().strip();
-        Ok(serde_json::json!({
+        let observation = observation_json(e.observe());
+        let mut reply = serde_json::json!({
             "interject": r.interject,
             "text": r.text,
             "milestone": r.milestone,
-            "strip": strip,
-            "why": r.trace.explain_text(),
-        })
-        .to_string())
+        });
+        reply["observation"] = observation;
+        Ok(reply.to_string())
     })
 }
 
 #[no_mangle]
 pub extern "C" fn observe() -> i32 {
-    with_engine(|e| Ok(e.observe().panel()))
+    with_engine(|e| Ok(observation_json(e.observe()).to_string()))
 }
 
 #[no_mangle]
-pub extern "C" fn ayumi() -> i32 {
-    with_engine(|e| Ok(e.ayumi_text()))
+pub extern "C" fn history() -> i32 {
+    with_engine(|e| {
+        let history = serde_json::to_string(&e.history()).map_err(|err| err.to_string())?;
+        let observation = observation_json(e.observe());
+        Ok(format!(
+            "{{\"history\":{history},\"observation\":{observation}}}"
+        ))
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn why() -> i32 {
-    with_engine(|e| Ok(e.why_text()))
+    with_engine(|e| {
+        let trace = serde_json::to_string(&e.last_trace()).map_err(|err| err.to_string())?;
+        let observation = observation_json(e.observe());
+        Ok(format!(
+            "{{\"trace\":{trace},\"observation\":{observation}}}"
+        ))
+    })
 }
 
 /// `/good` (1) or `/bad` (0) on the last reply.
 #[no_mangle]
 pub extern "C" fn feedback(good: i32) -> i32 {
-    with_engine(|e| e.feedback(good != 0).map_err(|err| err.to_string()))
+    with_engine(|e| {
+        if e.last_trace().is_none() && e.observe().last_path.is_none() {
+            return Err("まだ評価できる返答がありません。".into());
+        }
+        e.feedback(good != 0).map_err(|err| err.to_string())?;
+        Ok(if good != 0 {
+            "この返し方を少し選びやすくしました。"
+        } else {
+            "この返し方を少し控えるようにしました。"
+        }
+        .into())
+    })
 }
 
 /// Whole log as JSONL, for localStorage persistence. Reopening from this

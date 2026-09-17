@@ -66,6 +66,28 @@ pub struct Stats {
     pub path_prior: [f32; 5],
 }
 
+/// Log-derived facts shared by the CLI record and structured frontends.
+#[derive(Debug, serde::Serialize)]
+pub struct History<'a> {
+    pub first_speech_t: Option<u64>,
+    pub last_speech_t: Option<u64>,
+    pub first_learned_user: Option<&'a str>,
+    /// Calendar-day difference between the first and latest speech records.
+    pub age_days: u64,
+    pub learned_marks: Vec<usize>,
+    pub day_marks: Vec<u64>,
+    pub weather: Option<&'static str>,
+    pub care_word: Option<String>,
+    pub aloof: bool,
+    pub interests: Vec<HistoryInterest<'a>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct HistoryInterest<'a> {
+    pub word: &'a str,
+    pub score: f32,
+}
+
 pub struct Engine {
     intern: Interner,
     tokenizer: Tokenizer,
@@ -1356,48 +1378,94 @@ impl Engine {
         out
     }
 
+    /// Structured record derived from the same log facts as `/ayumi`.
+    pub fn history(&self) -> History<'_> {
+        let d = &self.digest;
+        let mut history = History {
+            first_speech_t: d.first_speech_t,
+            last_speech_t: d.last_speech_t,
+            first_learned_user: d.first_learned_user.as_deref(),
+            age_days: 0,
+            learned_marks: Vec::new(),
+            day_marks: Vec::new(),
+            weather: None,
+            care_word: None,
+            aloof: d.aloof_left > 0,
+            interests: self
+                .interest
+                .established(self.params.hearsay_min)
+                .into_iter()
+                .filter_map(|id| {
+                    self.interest
+                        .score(id, self.params.hearsay_min)
+                        .map(|score| HistoryInterest {
+                            word: self.intern.get(id),
+                            score,
+                        })
+                })
+                .filter(|interest| !crate::tokenizer::is_punct_str(interest.word))
+                .collect(),
+        };
+        if let (Some(first), Some(last)) = (d.first_speech_t, d.last_speech_t) {
+            let day = weather::day_of_ms(last);
+            history.age_days = day.saturating_sub(weather::day_of_ms(first));
+            (history.learned_marks, history.day_marks) =
+                milestone::achieved(d.learned, history.age_days);
+            if self.params.weather {
+                history.weather = Some(weather::day_weather(self.seed, day).name);
+                history.care_word = self.care_word(day);
+            }
+        }
+        history.interests.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.word.cmp(b.word))
+        });
+        history.interests.truncate(5);
+        history
+    }
+
     /// あゆみ — the one-page record of this individual: birth day, 初語,
     /// counts, marks, today's 日和, and the current 関心 top words. Every
     /// number is derived from the log; nothing here is a mood model.
     pub fn ayumi_text(&self) -> String {
         let s = self.stats();
-        let d = &self.digest;
+        let h = self.history();
         let mut out = String::new();
         out.push_str("あゆみ — 人工無脳君\n");
-        match (d.first_speech_t, d.last_speech_t) {
-            (Some(f), Some(l)) => {
+        match (h.first_speech_t, h.last_speech_t) {
+            (Some(f), Some(_)) => {
                 let fd = weather::day_of_ms(f);
                 let (y, m, dd) = weather::civil_from_day(fd);
-                let age = weather::day_of_ms(l).saturating_sub(fd);
                 out.push_str(&format!(
                     "うまれた日  {y:04}-{m:02}-{dd:02}（{}日目）\n",
-                    age + 1
+                    h.age_days + 1
                 ));
-                if let Some(fw) = &d.first_learned_user {
+                if let Some(fw) = h.first_learned_user {
                     out.push_str(&format!("初語        「{fw}」\n"));
                 }
-                let (lm, dm) = milestone::achieved(d.learned, age);
-                if !lm.is_empty() || !dm.is_empty() {
-                    let lms: Vec<String> = lm.iter().map(|m| format!("吸収{m}")).collect();
-                    let dms: Vec<String> = dm.iter().map(|m| format!("{m}日")).collect();
+                if !h.learned_marks.is_empty() || !h.day_marks.is_empty() {
+                    let lms: Vec<String> =
+                        h.learned_marks.iter().map(|m| format!("吸収{m}")).collect();
+                    let dms: Vec<String> = h.day_marks.iter().map(|m| format!("{m}日")).collect();
                     out.push_str(&format!(
                         "節目        {}\n",
                         lms.into_iter().chain(dms).collect::<Vec<_>>().join(" ")
                     ));
                 }
-                if self.params.weather {
-                    let day = weather::day_of_ms(l);
-                    let w = weather::day_weather(self.seed, day);
-                    let care = self
-                        .care_word(day)
+                if let Some(weather) = h.weather {
+                    let care = h
+                        .care_word
+                        .as_ref()
                         .map(|c| format!("  気になる語「{c}」"))
                         .unwrap_or_default();
-                    let aloof = if d.aloof_left > 0 {
+                    let aloof = if h.aloof {
                         "（よそよそしい）"
                     } else {
                         ""
                     };
-                    out.push_str(&format!("日和        {}{care}{aloof}\n", w.name));
+                    out.push_str(&format!("日和        {weather}{care}{aloof}\n"));
                 }
             }
             _ => out.push_str("うまれた日  （まだ記録なし）\n"),
@@ -1406,32 +1474,19 @@ impl Engine {
             "発話 {}  吸収 {}  tokens {}  vocab {}\n",
             s.utterances, s.learned, s.tokens, s.vocab
         ));
-        let p = &d.paths;
-        if d.path_known > 0 {
+        let p = &self.digest.paths;
+        if self.digest.path_known > 0 {
             out.push_str(&format!(
                 "経路        trig={} mark={} retr={} echo={} adpt={}\n",
                 p[0], p[1], p[2], p[3], p[4]
             ));
         }
-        let mut tops: Vec<(String, f32)> = self
-            .interest
-            .established(self.params.hearsay_min)
-            .into_iter()
-            .filter_map(|id| {
-                self.interest
-                    .score(id, self.params.hearsay_min)
-                    .map(|sc| (self.intern.get(id).to_string(), sc))
-            })
-            .filter(|(w, _)| !crate::tokenizer::is_punct_str(w))
-            .collect();
-        tops.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        tops.truncate(5);
-        if !tops.is_empty() {
-            let line: Vec<String> = tops.iter().map(|(w, sc)| format!("{w}({sc:.2})")).collect();
+        if !h.interests.is_empty() {
+            let line: Vec<String> = h
+                .interests
+                .iter()
+                .map(|interest| format!("{}({:.2})", interest.word, interest.score))
+                .collect();
             out.push_str(&format!("関心        {}\n", line.join(" ")));
         }
         out
@@ -2409,19 +2464,24 @@ mod tests {
     }
 
     #[test]
-    fn ayumi_reports_birth_and_first_word() {
+    fn history_keeps_first_learned_input_across_turns_and_reopen() {
         let params = Params {
             p_learn: 1.0,
             p_slip: 0.0,
             ..Params::default()
         };
-        let mut e = Engine::ephemeral(params, 7).unwrap();
+        let mut e = Engine::ephemeral(params.clone(), 7).unwrap();
+        assert_eq!(e.history().first_learned_user, None);
+        assert_eq!(e.history().first_speech_t, None);
         e.respond("はじめてのあいさつ").unwrap();
-        let a = e.ayumi_text();
-        assert!(a.contains("うまれた日"), "{a}");
-        assert!(a.contains("初語"), "{a}");
-        assert!(a.contains("はじめてのあいさつ"), "{a}");
-        assert!(a.contains("発話 2"), "{a}");
+        let first_time = e.history().first_speech_t.unwrap();
+        e.respond("二度目のあいさつ").unwrap();
+        let reopened = Engine::open_from_text(params, 7, &e.export_log()).unwrap();
+        for engine in [&e, &reopened] {
+            let history = engine.history();
+            assert_eq!(history.first_learned_user, Some("はじめてのあいさつ"));
+            assert_eq!(history.first_speech_t, Some(first_time));
+        }
     }
 
     #[test]
